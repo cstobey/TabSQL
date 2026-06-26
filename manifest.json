@@ -1,13 +1,13 @@
 {
   "manifest_version": 3,
-  "name": "Tab Outliner+",
+  "name": "TabSQL",
   "version": "0.1.0",
-  "description": "Tab Outliner clone with SQLite/MariaDB backend",
+  "description": "Tab manager with SQLite/MariaDB backend and SQL console",
   "background": {
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "Tab Outliner+",
+    "default_title": "TabSQL",
     "default_icon": {
       "16":  "icons/icon16.png",
       "48":  "icons/icon48.png",
@@ -25,7 +25,7 @@
   "commands": {
     "open_sidebar": {
       "suggested_key": { "default": "Ctrl+Shift+E" },
-      "description": "Open Tab Outliner+"
+      "description": "Open TabSQL"
     }
   },
   "web_accessible_resources": [{

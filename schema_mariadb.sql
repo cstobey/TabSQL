@@ -1,8 +1,8 @@
--- Tab Outliner clone schema - MariaDB dialect
--- Run as: mysql -u root -p taboutliner < schema_mariadb.sql
+-- TabSQL schema (Tab Outliner clone) - MariaDB dialect
+-- Run as: mysql -u root -p tabsql < schema_mariadb.sql
 
-CREATE DATABASE IF NOT EXISTS taboutliner CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-USE taboutliner;
+CREATE DATABASE IF NOT EXISTS tabsql CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE tabsql;
 
 CREATE TABLE IF NOT EXISTS node (
     id             BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,

@@ -170,8 +170,8 @@ def start_http(db, port: int) -> None:
 
 def main() -> None:
     config = load_config()
-    setup_logging(config.get('log_file', '~/taboutliner_daemon.log'))
-    logging.info("Tab Outliner daemon starting")
+    setup_logging(config.get('log_file', '~/tabsql_daemon.log'))
+    logging.info("TabSQL daemon starting")
 
     db = make_backend(config)
     db.connect()

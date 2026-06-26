@@ -6,11 +6,11 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$ExtensionId,
 
-    [string]$InstallDir = "C:\taboutliner"
+    [string]$InstallDir = "C:\TabSQL"
 )
 
-$manifestSrc = Join-Path $PSScriptRoot "com.taboutliner.host.json"
-$manifestDst = Join-Path $InstallDir "com.taboutliner.host.json"
+$manifestSrc = Join-Path $PSScriptRoot "com.tabsql.host.json"
+$manifestDst = Join-Path $InstallDir "com.tabsql.host.json"
 $wrapperSrc  = Join-Path $PSScriptRoot "host_wrapper.bat"
 $wrapperDst  = Join-Path $InstallDir "daemon\host_wrapper.bat"
 
@@ -28,7 +28,7 @@ Copy-Item $wrapperSrc $wrapperDst -Force
 Write-Host "Wrapper copied to $wrapperDst"
 
 # Register in Windows registry (HKCU - no admin needed for user install)
-$regPath = "HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.taboutliner.host"
+$regPath = "HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.tabsql.host"
 New-Item -Path $regPath -Force | Out-Null
 Set-ItemProperty -Path $regPath -Name "(Default)" -Value $manifestDst
 Write-Host "Registry key set: $regPath -> $manifestDst"

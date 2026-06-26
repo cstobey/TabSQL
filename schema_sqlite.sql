@@ -1,4 +1,4 @@
--- Tab Outliner clone schema - SQLite dialect
+-- TabSQL schema (Tab Outliner clone) - SQLite dialect
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 

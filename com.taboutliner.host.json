@@ -1,9 +1,0 @@
-{
-  "name": "com.taboutliner.host",
-  "description": "Tab Outliner+ native messaging host",
-  "path": "C:\\taboutliner\\daemon\\host_wrapper.bat",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://REPLACE_WITH_YOUR_EXTENSION_ID/"
-  ]
-}

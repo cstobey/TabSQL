@@ -3,7 +3,7 @@
 
 'use strict';
 
-const HOST_NAME = 'com.taboutliner.host';
+const HOST_NAME = 'com.tabsql.host';
 let port = null;
 let pendingCallbacks = {};
 let nextMsgId = 1;
@@ -16,12 +16,12 @@ function connectHost() {
   port = chrome.runtime.connectNative(HOST_NAME);
   port.onMessage.addListener(onHostMessage);
   port.onDisconnect.addListener(() => {
-    console.warn('Tab Outliner+ host disconnected:', chrome.runtime.lastError?.message);
+    console.warn('TabSQL host disconnected:', chrome.runtime.lastError?.message);
     port = null;
     // Retry after 5s
     setTimeout(connectHost, 5000);
   });
-  console.log('Tab Outliner+ host connected');
+  console.log('TabSQL host connected');
 }
 
 function onHostMessage(msg) {
@@ -147,4 +147,4 @@ chrome.windows.onCreated.addListener(win => syncWindow(win));
 // -------------------------------------------------------------------------
 
 connectHost();
-console.log('Tab Outliner+ background started');
+console.log('TabSQL background started');

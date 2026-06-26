@@ -1,15 +1,15 @@
 {
   "backend": "sqlite",
   "sqlite": {
-    "path": "~/taboutliner.db"
+    "path": "~/tabsql.db"
   },
   "mariadb": {
     "host": "127.0.0.1",
     "port": 3306,
-    "user": "taboutliner",
+    "user": "tabsql",
     "password": "CHANGE_ME",
-    "database": "taboutliner"
+    "database": "tabsql"
   },
-  "log_file": "~/taboutliner_daemon.log",
+  "log_file": "~/tabsql_daemon.log",
   "http_port": 7779
 }

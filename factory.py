@@ -31,7 +31,7 @@ def make_backend(config: dict | None = None) -> BaseBackend:
             port=m.get("port", 3306),
             user=m["user"],
             password=m["password"],
-            database=m.get("database", "taboutliner"),
+            database=m.get("database", "tabsql"),
         )
 
     else:

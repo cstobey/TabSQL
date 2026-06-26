@@ -1,11 +1,11 @@
-# Tab Outliner+
+# TabSQL
 
-Tab Outliner clone with SQLite/MariaDB backend, native messaging host, and SQL management console.
+TabSQL — Tab Outliner clone with SQLite/MariaDB backend, native messaging host, and SQL management console.
 
 ## Structure
 
 ```
-taboutliner/
+TabSQL/
   daemon/
     host.py          # native messaging host + HTTP server
     config.json      # backend config (edit before running)
@@ -24,11 +24,11 @@ taboutliner/
     schema_sqlite.sql
     schema_mariadb.sql
   scripts/
-    com.taboutliner.host.json   # Chrome native messaging manifest
-    host_wrapper.bat            # launched by Chrome on Windows
-    install_host.ps1            # one-shot Windows install script
+    com.tabsql.host.json     # Chrome native messaging manifest
+    host_wrapper.bat         # launched by Chrome on Windows
+    install_host.ps1         # one-shot Windows install script
   migrate.py
-  management_ui.html            # open in browser, talks to HTTP endpoint
+  management_ui.html         # open in browser, talks to HTTP endpoint
 ```
 
 ## Setup (Windows 11)
@@ -36,7 +36,7 @@ taboutliner/
 ### 1. Migrate your data
 
 ```cmd
-cd C:\taboutliner
+cd C:\TabSQL
 python migrate.py --tree path\to\tree-exported-Wed-Jun-17-2026.tree
 ```
 
@@ -50,25 +50,25 @@ Then: `pip install pymysql`
 
 - Open `chrome://extensions`
 - Enable **Developer mode**
-- **Load unpacked** → select `taboutliner/extension/`
+- **Load unpacked** → select `TabSQL/extension/`
 - Note the **Extension ID** (32-char string)
 
 ### 3. Install native messaging host
 
 ```powershell
 # Run in PowerShell (no admin needed)
-cd C:\taboutliner\scripts
-.\install_host.ps1 -ExtensionId "YOUR_EXTENSION_ID_HERE" -InstallDir "C:\taboutliner"
+cd C:\TabSQL\scripts
+.\install_host.ps1 -ExtensionId "YOUR_EXTENSION_ID_HERE" -InstallDir "C:\TabSQL"
 ```
 
 This writes the registry key Chrome looks for at:
-`HKCU\Software\Google\Chrome\NativeMessagingHosts\com.taboutliner.host`
+`HKCU\Software\Google\Chrome\NativeMessagingHosts\com.tabsql.host`
 
 Edit `host_wrapper.bat` if your Python path differs from `C:\Python312\python.exe`.
 
 ### 4. Verify
 
-Restart Chrome. Click the Tab Outliner+ icon — the sidebar should open and load your tree.
+Restart Chrome. Click the TabSQL icon — the sidebar should open and load your tree.
 
 The daemon also serves a management HTTP API on `http://127.0.0.1:7779`.
 Open `management_ui.html` in a browser for the SQL console.
@@ -87,12 +87,12 @@ No code changes. Both backends implement the same interface.
 
 SQLite:
 ```sh
-sqlite3 ~/taboutliner.db "SELECT * FROM window_summary"
+sqlite3 ~/tabsql.db "SELECT * FROM window_summary"
 ```
 
 MariaDB:
 ```sh
-mysql -u taboutliner -p taboutliner -e "SELECT * FROM window_summary"
+mysql -u tabsql -p tabsql -e "SELECT * FROM window_summary"
 ```
 
 HTTP (daemon must be running):

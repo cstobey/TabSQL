@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Tab Outliner+ SQL Console</title>
+<title>TabSQL SQL Console</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 :root {
@@ -47,7 +47,7 @@ tr:hover td { background: var(--hover); }
 </head>
 <body>
 <header>
-  <h1>Tab Outliner+ SQL Console</h1>
+  <h1>TabSQL SQL Console</h1>
   <span class="pill" id="backend-pill">connecting…</span>
 </header>
 <div id="main">
@@ -141,7 +141,7 @@ function exportCSV() {
   const blob = new Blob([lines.join('\n')], {type:'text/csv'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'taboutliner_query.csv';
+  a.download = 'tabsql_query.csv';
   a.click();
 }
 
