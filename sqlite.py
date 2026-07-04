@@ -4,7 +4,7 @@ db/sqlite.py - SQLite backend.
 from __future__ import annotations
 import sqlite3
 from pathlib import Path
-from .base import BaseBackend
+from base import BaseBackend
 
 
 class SQLiteBackend(BaseBackend):
@@ -49,6 +49,6 @@ class SQLiteBackend(BaseBackend):
         return cur.lastrowid
 
     def init_schema(self) -> None:
-        schema = Path(__file__).parent.parent.parent / "sql" / "schema_sqlite.sql"
+        schema = Path(__file__).parent / "schema_sqlite.sql"
         self._c.executescript(schema.read_text())
         self._c.commit()

@@ -233,7 +233,7 @@ document.getElementById('btn-refresh').addEventListener('click', load);
 
 document.getElementById('btn-sql').addEventListener('click', () => {
   chrome.windows.create({
-    url: 'http://127.0.0.1:7779/',
+    url: chrome.runtime.getURL('management_ui.html'),
     type: 'popup', width: 900, height: 600
   });
 });

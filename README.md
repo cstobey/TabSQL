@@ -4,31 +4,27 @@ TabSQL — Tab Outliner clone with SQLite/MariaDB backend, native messaging host
 
 ## Structure
 
+All files live flat in the project root (load the root folder as the unpacked extension):
+
 ```
 TabSQL/
-  daemon/
-    host.py          # native messaging host + HTTP server
-    config.json      # backend config (edit before running)
-    db/
-      base.py        # abstract backend
-      sqlite.py
-      mariadb.py
-      factory.py
-  extension/
-    manifest.json
-    background.js
-    sidebar/
-      index.html
-      tree.js
-  sql/
-    schema_sqlite.sql
-    schema_mariadb.sql
-  scripts/
-    com.tabsql.host.json     # Chrome native messaging manifest
-    host_wrapper.bat         # launched by Chrome on Windows
-    install_host.ps1         # one-shot Windows install script
-  migrate.py
-  management_ui.html         # open in browser, talks to HTTP endpoint
+  manifest.json              # Chrome extension manifest
+  background.js              # MV3 service worker
+  index.html                 # sidebar UI
+  tree.js                    # sidebar logic
+  management_ui.html         # SQL console (open in browser)
+  host.py                    # native messaging host + HTTP server
+  config.json                # backend config (edit before running)
+  base.py                    # abstract DB backend
+  sqlite.py
+  mariadb.py
+  factory.py
+  migrate.py                 # import Tab Outliner .tree exports
+  schema_sqlite.sql
+  schema_mariadb.sql
+  com.tabsql.host.json       # Chrome native messaging manifest
+  host_wrapper.bat           # launched by Chrome on Windows
+  install_host.ps1           # one-shot Windows install script
 ```
 
 ## Setup (Windows 11)
@@ -50,14 +46,14 @@ Then: `pip install pymysql`
 
 - Open `chrome://extensions`
 - Enable **Developer mode**
-- **Load unpacked** → select `TabSQL/extension/`
+- **Load unpacked** → select the `TabSQL/` folder itself (the project root)
 - Note the **Extension ID** (32-char string)
 
 ### 3. Install native messaging host
 
 ```powershell
 # Run in PowerShell (no admin needed)
-cd C:\TabSQL\scripts
+cd C:\TabSQL\
 .\install_host.ps1 -ExtensionId "YOUR_EXTENSION_ID_HERE" -InstallDir "C:\TabSQL"
 ```
 

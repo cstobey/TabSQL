@@ -4,7 +4,7 @@ pip install pymysql
 """
 from __future__ import annotations
 from pathlib import Path
-from .base import BaseBackend
+from base import BaseBackend
 
 try:
     import pymysql
@@ -70,7 +70,7 @@ class MariaDBBackend(BaseBackend):
         self.commit()
 
     def init_schema(self) -> None:
-        schema = Path(__file__).parent.parent.parent / "sql" / "schema_mariadb.sql"
+        schema = Path(__file__).parent / "schema_mariadb.sql"
         sql = schema.read_text()
         with self._c.cursor() as cur:
             for statement in sql.split(';'):

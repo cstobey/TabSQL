@@ -16,8 +16,7 @@ import threading
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from db import make_backend
-from db.factory import load_config
+from factory import make_backend, load_config
 
 # ---------------------------------------------------------------------------
 # Logging

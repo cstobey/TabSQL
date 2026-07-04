@@ -7,12 +7,7 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "TabSQL",
-    "default_icon": {
-      "16":  "icons/icon16.png",
-      "48":  "icons/icon48.png",
-      "128": "icons/icon128.png"
-    }
+    "default_title": "TabSQL"
   },
   "permissions": [
     "tabs",
@@ -20,7 +15,8 @@
     "storage",
     "nativeMessaging",
     "favicon",
-    "system.display"
+    "system.display",
+    "clipboardWrite"
   ],
   "commands": {
     "open_sidebar": {
@@ -29,7 +25,7 @@
     }
   },
   "web_accessible_resources": [{
-    "resources": ["sidebar/index.html"],
+    "resources": ["index.html", "management_ui.html"],
     "matches": ["<all_urls>"]
   }]
 }

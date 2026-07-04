@@ -19,9 +19,7 @@ import logging
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / 'daemon'))
-from db import make_backend
-from db.factory import load_config
+from factory import make_backend, load_config
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -128,7 +126,7 @@ def main() -> None:
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args()
 
-    config_path = args.config or (Path(__file__).parent / 'daemon' / 'config.json')
+    config_path = args.config or (Path(__file__).parent / 'config.json')
     config = load_config(config_path)
     migrate(args.tree, config, dry_run=args.dry_run)
 

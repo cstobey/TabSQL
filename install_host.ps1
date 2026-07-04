@@ -1,33 +1,40 @@
 # install_host.ps1
-# Run as Administrator after loading the extension and getting its ID.
 # Usage: .\install_host.ps1 -ExtensionId "abcdefghijklmnopabcdefghijklmnop"
+# -InstallDir defaults to the folder this script lives in (the project root).
 
 param(
     [Parameter(Mandatory=$true)]
     [string]$ExtensionId,
 
-    [string]$InstallDir = "C:\TabSQL"
+    [string]$InstallDir = $PSScriptRoot
 )
 
 $manifestSrc = Join-Path $PSScriptRoot "com.tabsql.host.json"
 $manifestDst = Join-Path $InstallDir "com.tabsql.host.json"
 $wrapperSrc  = Join-Path $PSScriptRoot "host_wrapper.bat"
-$wrapperDst  = Join-Path $InstallDir "daemon\host_wrapper.bat"
+$wrapperDst  = Join-Path $InstallDir "host_wrapper.bat"
 
-# Update allowed_origins in manifest
+# Patch host_wrapper.bat with the actual install dir and write to destination
+$wrapperContent = Get-Content $wrapperSrc -Raw
+$wrapperContent = $wrapperContent -replace 'set DAEMON_DIR=.*', "set DAEMON_DIR=$InstallDir"
+if ($manifestSrc -ne $wrapperDst) {
+    Set-Content $wrapperDst $wrapperContent -Encoding ASCII
+    Write-Host "Wrapper written to $wrapperDst"
+} else {
+    Set-Content $wrapperDst $wrapperContent -Encoding ASCII
+    Write-Host "Wrapper patched at $wrapperDst"
+}
+
+# Update allowed_origins and path in manifest
 $manifest = Get-Content $manifestSrc | ConvertFrom-Json
 $manifest.allowed_origins = @("chrome-extension://$ExtensionId/")
 $manifest.path = $wrapperDst
 
-# Write manifest
+# Write manifest (in-place if src == dst, which is the common case)
 $manifest | ConvertTo-Json -Depth 5 | Set-Content $manifestDst -Encoding UTF8
 Write-Host "Manifest written to $manifestDst"
 
-# Copy wrapper
-Copy-Item $wrapperSrc $wrapperDst -Force
-Write-Host "Wrapper copied to $wrapperDst"
-
-# Register in Windows registry (HKCU - no admin needed for user install)
+# Register in Windows registry (HKCU - no admin needed)
 $regPath = "HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.tabsql.host"
 New-Item -Path $regPath -Force | Out-Null
 Set-ItemProperty -Path $regPath -Name "(Default)" -Value $manifestDst

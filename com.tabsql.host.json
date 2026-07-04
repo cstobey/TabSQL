@@ -1,9 +1,9 @@
-{
-  "name": "com.tabsql.host",
-  "description": "TabSQL native messaging host",
-  "path": "C:\\TabSQL\\daemon\\host_wrapper.bat",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://REPLACE_WITH_YOUR_EXTENSION_ID/"
-  ]
+﻿{
+    "name":  "com.tabsql.host",
+    "description":  "TabSQL native messaging host",
+    "path":  "C:\\Users\\chris.tobey\\Resilio Sync\\synced\\git\\TabSQL\\host_wrapper.bat",
+    "type":  "stdio",
+    "allowed_origins":  [
+                            "chrome-extension://fgbljopdhfjioabjpfnkeikkopnphdnl/"
+                        ]
 }
