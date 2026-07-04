@@ -34,9 +34,34 @@
              border-radius: 4px; padding: 3px 8px; cursor: pointer; font-size: 11px; white-space: nowrap; }
   .btn:hover { background: var(--border); }
 
-  #tree    { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 4px 0; }
+  #main    { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  #tree    { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 4px 0; min-height: 0; }
   #status  { font-size: 11px; color: var(--muted); padding: 3px 8px; background: var(--surface);
              border-top: 1px solid var(--border); flex-shrink: 0; }
+
+  /* SQL panel */
+  #sql-panel { height: 300px; display: flex; flex-direction: column; flex-shrink: 0;
+               border-top: 2px solid var(--accent); background: var(--bg); }
+  #sql-panel.hidden { display: none; }
+  #sql-bar   { display: flex; align-items: center; gap: 6px; padding: 4px 8px;
+               background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  #sql-bar span.label { font-size: 11px; color: var(--accent); font-weight: 600; }
+  #sql-quick { flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+               border-radius: 4px; padding: 2px 6px; font-size: 11px; }
+  #sql-status { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  #sql-input { flex-shrink: 0; background: var(--surface); border: none;
+               border-bottom: 1px solid var(--border); color: var(--text);
+               font: 12px/1.4 'JetBrains Mono','Consolas',monospace;
+               padding: 6px 8px; height: 72px; resize: none; outline: none; }
+  #sql-results { flex: 1; overflow: auto; font-size: 12px; }
+  #sql-results table  { width: 100%; border-collapse: collapse; }
+  #sql-results th     { background: var(--surface); color: var(--accent); text-align: left;
+                        padding: 4px 8px; position: sticky; top: 0; border-bottom: 1px solid var(--border);
+                        font-size: 11px; }
+  #sql-results td     { padding: 3px 8px; border-bottom: 1px solid var(--surface);
+                        max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #sql-results tr:hover td { background: var(--hover); }
+  .sql-null           { color: var(--muted); font-style: italic; }
 
   .node    { display: flex; align-items: center; min-height: var(--row-h);
              padding: 1px 4px; cursor: pointer; user-select: none; }
@@ -92,8 +117,22 @@
   <button class="btn" id="btn-sql" title="Open SQL console">SQL</button>
 </div>
 
-<div id="tree"></div>
-<div id="status">Loading…</div>
+<div id="main">
+  <div id="tree"></div>
+  <div id="status">Loading…</div>
+  <div id="sql-panel" class="hidden">
+    <div id="sql-bar">
+      <span class="label">SQL</span>
+      <select id="sql-quick"><option value="">Quick queries…</option></select>
+      <button class="btn" id="sql-run">▶ Run</button>
+      <span id="sql-status"></span>
+      <button class="btn" id="sql-close">✕</button>
+    </div>
+    <textarea id="sql-input" spellcheck="false"
+      placeholder="SELECT * FROM node LIMIT 20;  -- Ctrl+Enter to run"></textarea>
+    <div id="sql-results"></div>
+  </div>
+</div>
 
 <div id="ctx" class="hidden">
   <div class="ctx-item" data-action="open">Open</div>

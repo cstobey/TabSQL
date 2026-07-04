@@ -232,9 +232,6 @@ document.getElementById('tree').addEventListener('click', async e => {
 
   if (btn.classList.contains('act-del')) {
     const descIds = allDescendantIds(id);
-    const kidCount = descIds.size - 1;
-    const suffix = kidCount > 0 ? ` and ${kidCount} child node${kidCount > 1 ? 's' : ''}` : '';
-    if (!confirm(`Delete "${nodeLabel(n)}"${suffix}?`)) return;
     // Close chrome tab if open
     if (n.chrome_id && n.is_open) {
       try { await chrome.tabs.remove(n.chrome_id); } catch {}
@@ -292,6 +289,7 @@ ctx.addEventListener('click', async e => {
 // ── Drag & drop ───────────────────────────────────────────────────────────────
 
 const treeEl = document.getElementById('tree');
+let dropState = null; // { parentId: number|null }
 
 treeEl.addEventListener('dragstart', e => {
   const node = e.target.closest('.node');
@@ -307,6 +305,7 @@ treeEl.addEventListener('dragend', () => {
     el.classList.remove('dragging', 'drag-over');
   });
   dragSrcId = null;
+  dropState = null;
 });
 
 treeEl.addEventListener('dragover', e => {
@@ -315,27 +314,59 @@ treeEl.addEventListener('dragover', e => {
   if (!node) return;
   const targetId = +node.dataset.id;
   if (targetId === dragSrcId) return;
-  if (allDescendantIds(dragSrcId).has(targetId)) return; // prevent cycle
+
+  // Mouse X relative to tree → which depth level the pointer indicates.
+  // Indent formula: level 0 = 4px, each level adds 16px.
+  const treeRect  = treeEl.getBoundingClientRect();
+  const mouseX    = e.clientX - treeRect.left;
+  const indentPx  = parseInt(node.style.paddingLeft) || 4;
+  const nodeLevel = Math.round((indentPx - 4) / 16);
+  const hoverLevel = Math.max(0, Math.floor((mouseX - 4) / 16));
+
+  // Find effective parent: walk up from hovered node until we reach hoverLevel.
+  // hoverLevel >= nodeLevel → drop INTO the node (it becomes the parent).
+  // hoverLevel < nodeLevel  → dedent; ancestor at hoverLevel becomes parent.
+  let parentId;
+  if (hoverLevel >= nodeLevel) {
+    parentId = targetId;
+  } else {
+    const stepsUp = nodeLevel - hoverLevel;
+    let cur = nodeMap[targetId];
+    for (let i = 0; i < stepsUp; i++) {
+      cur = cur?.parent_id != null ? nodeMap[cur.parent_id] : null;
+    }
+    parentId = cur?.id ?? null;
+  }
+
+  // Block drops that would create a cycle (parentId inside dragged subtree)
+  if (parentId != null && allDescendantIds(dragSrcId).has(parentId)) return;
+
   e.preventDefault();
   e.dataTransfer.dropEffect = 'move';
+  dropState = { parentId };
+
+  // Highlight the effective parent node
   treeEl.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
-  node.classList.add('drag-over');
+  if (parentId != null) {
+    treeEl.querySelector(`[data-id="${parentId}"]`)?.classList.add('drag-over');
+  }
 });
 
 treeEl.addEventListener('dragleave', e => {
-  const node = e.target.closest('.node');
-  if (node) node.classList.remove('drag-over');
+  if (!treeEl.contains(e.relatedTarget)) {
+    treeEl.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+    dropState = null;
+  }
 });
 
 treeEl.addEventListener('drop', async e => {
   e.preventDefault();
-  const node = e.target.closest('.node');
-  if (!node || !dragSrcId) return;
-  const targetId = +node.dataset.id;
-  if (targetId === dragSrcId || allDescendantIds(dragSrcId).has(targetId)) return;
-  node.classList.remove('drag-over');
-  const pos = childrenOf(targetId).length; // append as last child
-  await db.moveNode(dragSrcId, targetId, pos);
+  if (!dragSrcId || !dropState) return;
+  treeEl.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+  const { parentId } = dropState;
+  dropState = null;
+  const pos = childrenOf(parentId).length;
+  await db.moveNode(dragSrcId, parentId, pos);
   dragSrcId = null;
   load();
 });
@@ -352,12 +383,7 @@ document.getElementById('search').addEventListener('input', e => {
 
 document.getElementById('btn-refresh').addEventListener('click', load);
 
-document.getElementById('btn-sql').addEventListener('click', () => {
-  chrome.windows.create({
-    url: chrome.runtime.getURL('management_ui.html'),
-    type: 'popup', width: 900, height: 600,
-  });
-});
+document.getElementById('btn-sql').addEventListener('click', () => toggleSqlPanel());
 
 // ── Live updates ──────────────────────────────────────────────────────────────
 
@@ -372,6 +398,105 @@ chrome.tabs.onRemoved.addListener(scheduleRefresh);
 chrome.tabs.onUpdated.addListener(scheduleRefresh);
 chrome.windows.onCreated.addListener(scheduleRefresh);
 chrome.windows.onRemoved.addListener(scheduleRefresh);
+
+// ── SQL panel ─────────────────────────────────────────────────────────────────
+
+const SQL_QUICK = [
+  ['Node counts',    `SELECT node_type, COUNT(*) c FROM node GROUP BY node_type ORDER BY c DESC`],
+  ['Open tabs',      `SELECT * FROM node WHERE is_open=1 AND node_type='tab' ORDER BY position`],
+  ['Saved tabs',     `SELECT * FROM node WHERE node_type='savedtab' ORDER BY updated_at DESC LIMIT 100`],
+  ['Window summary', `SELECT * FROM window_summary ORDER BY tab_count DESC`],
+  ['Tab flat view',  `SELECT * FROM tab_flat LIMIT 100`],
+  ['Duplicate URLs', `SELECT url, COUNT(*) c FROM node WHERE url IS NOT NULL GROUP BY url HAVING c>1 ORDER BY c DESC`],
+  ['Recently added', `SELECT * FROM node ORDER BY created_at DESC LIMIT 50`],
+  ['All notes',      `SELECT * FROM node WHERE note_text IS NOT NULL ORDER BY updated_at DESC`],
+];
+
+// Populate quick-query select
+const sqlQuickEl = document.getElementById('sql-quick');
+SQL_QUICK.forEach(([label, sql]) => {
+  const opt = document.createElement('option');
+  opt.value = sql;
+  opt.textContent = label;
+  sqlQuickEl.appendChild(opt);
+});
+
+let sqlLastRows = [];
+
+async function runSQL(sql) {
+  const statusEl  = document.getElementById('sql-status');
+  const resultsEl = document.getElementById('sql-results');
+  statusEl.textContent = 'Running…';
+  const t0 = Date.now();
+  try {
+    const r = await db.query(sql);
+    const rows = r?.rows ?? [];
+    const elapsed = Date.now() - t0;
+    sqlLastRows = rows;
+    renderSqlTable(rows);
+    statusEl.textContent = `${rows.length} row${rows.length !== 1 ? 's' : ''} · ${elapsed}ms`;
+    if (!/^\s*SELECT/i.test(sql)) load(); // refresh tree after mutations
+  } catch(e) {
+    resultsEl.innerHTML = `<div style="color:var(--red);padding:8px;font-size:12px">Error: ${escHtml(e.message)}</div>`;
+    statusEl.textContent = 'Error';
+    sqlLastRows = [];
+  }
+}
+
+function renderSqlTable(rows) {
+  const el = document.getElementById('sql-results');
+  if (!rows.length) {
+    el.innerHTML = '<div style="padding:8px;color:var(--muted);font-size:12px">No rows returned.</div>';
+    return;
+  }
+  const cols   = Object.keys(rows[0]);
+  const header = `<tr>${cols.map(c => `<th>${escHtml(c)}</th>`).join('')}</tr>`;
+  const body   = rows.map(row =>
+    `<tr>${cols.map(c => {
+      const v = row[c];
+      return (v === null || v === undefined)
+        ? `<td class="sql-null">NULL</td>`
+        : `<td title="${escHtml(String(v))}">${escHtml(String(v))}</td>`;
+    }).join('')}</tr>`
+  ).join('');
+  el.innerHTML = `<table><thead>${header}</thead><tbody>${body}</tbody></table>`;
+}
+
+function toggleSqlPanel(show) {
+  const panel = document.getElementById('sql-panel');
+  const opening = show !== undefined ? show : panel.classList.contains('hidden');
+  panel.classList.toggle('hidden', !opening);
+  if (opening) {
+    const inp = document.getElementById('sql-input');
+    inp.focus();
+    if (!inp.value.trim()) {
+      inp.value = SQL_QUICK[0][1];
+      runSQL(inp.value);
+    }
+  }
+}
+
+sqlQuickEl.addEventListener('change', e => {
+  const sql = e.target.value;
+  if (!sql) return;
+  document.getElementById('sql-input').value = sql;
+  runSQL(sql);
+  e.target.value = '';
+});
+
+document.getElementById('sql-run').addEventListener('click', () => {
+  const sql = document.getElementById('sql-input').value.trim();
+  if (sql) runSQL(sql);
+});
+
+document.getElementById('sql-input').addEventListener('keydown', e => {
+  if (e.ctrlKey && e.key === 'Enter') {
+    const sql = e.target.value.trim();
+    if (sql) runSQL(sql);
+  }
+});
+
+document.getElementById('sql-close').addEventListener('click', () => toggleSqlPanel(false));
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
