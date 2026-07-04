@@ -210,6 +210,7 @@ async function upsertWin(chromeWin) {
     is_open:   1,
     chrome_id: chromeWin.id,
     win_rect:  `${chromeWin.left}_${chromeWin.top}_${chromeWin.width}_${chromeWin.height}`,
+    relicons:  chromeWin.type ?? 'normal',
   });
   await persistDb();
   return id;

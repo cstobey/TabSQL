@@ -62,7 +62,7 @@ function childrenOf(parentId) {
 
 function nodeIcon(n) {
   switch(n.node_type) {
-    case 'win':         return '🪟';
+    case 'win':         return n.relicons === 'popup' ? '🔲' : '🪟';
     case 'savedwin':    return '📁';
     case 'tab':         return '⬤';
     case 'savedtab':    return '·';
@@ -90,6 +90,8 @@ function buildTree(parentId = null, depth = 0) {
     const indent   = depth * 16;
     const label    = nodeLabel(n);
     const icon     = nodeIcon(n);
+    const winType  = (n.node_type === 'win' || n.node_type === 'savedwin') && n.relicons && n.relicons !== 'normal'
+                     ? `<span class="badge" style="color:var(--accent);opacity:.7">${escHtml(n.relicons)}</span>` : '';
     const badge    = hasKids ? `<span class="badge">${kids.length}</span>` : '';
     const toggle   = hasKids
       ? `<span class="toggle">${isColl ? '▶' : '▼'}</span>`
@@ -113,7 +115,7 @@ function buildTree(parentId = null, depth = 0) {
               ${toggle}
               ${faviconHtml || `<span class="icon">${icon}</span>`}
               <span class="label ${label ? '' : 'muted'}">${escHtml(label)}</span>
-              ${badge}
+              ${winType}${badge}
             </div>
             ${kidHtml}`;
   }).join('');
@@ -166,9 +168,18 @@ document.getElementById('tree').addEventListener('click', e => {
   document.querySelectorAll('.node.selected').forEach(el => el.classList.remove('selected'));
   node.classList.add('selected');
 
-  // Double-click: open URL
-  if (e.detail === 2 && n?.url) {
-    chrome.tabs.create({ url: n.url });
+  // Double-click: focus existing tab if open, otherwise open new
+  if (e.detail === 2) {
+    if (n?.is_open && n?.chrome_id) {
+      chrome.tabs.get(n.chrome_id).then(tab => {
+        chrome.tabs.update(n.chrome_id, { active: true });
+        chrome.windows.update(tab.windowId, { focused: true });
+      }).catch(() => {
+        if (n.url) chrome.tabs.create({ url: n.url });
+      });
+    } else if (n?.url) {
+      chrome.tabs.create({ url: n.url });
+    }
   }
 });
 
@@ -249,6 +260,23 @@ function escHtml(s) {
 function setStatus(msg) {
   document.getElementById('status').textContent = msg;
 }
+
+// -------------------------------------------------------------------------
+// Live updates
+// -------------------------------------------------------------------------
+
+let liveTimer = null;
+function scheduleRefresh() {
+  clearTimeout(liveTimer);
+  // delay lets background.js write to DB before we re-fetch
+  liveTimer = setTimeout(load, 600);
+}
+
+chrome.tabs.onCreated.addListener(scheduleRefresh);
+chrome.tabs.onRemoved.addListener(scheduleRefresh);
+chrome.tabs.onUpdated.addListener(scheduleRefresh);
+chrome.windows.onCreated.addListener(scheduleRefresh);
+chrome.windows.onRemoved.addListener(scheduleRefresh);
 
 // -------------------------------------------------------------------------
 // Boot
