@@ -61,6 +61,19 @@
 
   .children { /* indented by JS via padding-left on child nodes */ }
 
+  /* Action buttons (save/delete) — shown on hover */
+  .actions  { display: none; align-items: center; gap: 2px; margin-left: auto; flex-shrink: 0; }
+  .node:hover .actions { display: flex; }
+  .act      { background: none; border: none; cursor: pointer; color: var(--muted);
+              font-size: 11px; padding: 1px 4px; border-radius: 2px; line-height: 1; }
+  .act:hover { color: var(--text); background: var(--border); }
+  .act-del:hover { color: var(--red); }
+  .act-save:hover { color: var(--accent); }
+
+  /* Drag & drop */
+  .node.dragging  { opacity: .35; }
+  .node.drag-over { outline: 1px solid var(--accent); background: rgba(124,158,248,.12); }
+
   /* Context menu */
   #ctx { position: fixed; background: var(--surface); border: 1px solid var(--border);
          border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,.5); z-index: 999;

@@ -3,25 +3,30 @@
 importScripts('sql-wasm.js');
 
 const DB_KEY = 'tabsql_db_v1';
-let SQL = null;
-let db  = null;
+let SQL         = null;
+let db          = null;
+let dbReady     = null;   // promise — prevents concurrent init races
+let pendingAdopt = null;  // { nodeId, url, ts } — set by pre_open_tab message
 
 // ---------------------------------------------------------------------------
 // DB init & persistence
 // ---------------------------------------------------------------------------
 
-async function ensureDb() {
-  if (db) return;
-  if (!SQL) {
-    SQL = await initSqlJs({ locateFile: () => chrome.runtime.getURL('sql-wasm.wasm') });
-  }
+async function _initDb() {
+  SQL = await initSqlJs({ locateFile: () => chrome.runtime.getURL('sql-wasm.wasm') });
   const stored = await chrome.storage.local.get(DB_KEY);
   if (stored[DB_KEY]) {
     db = new SQL.Database(new Uint8Array(stored[DB_KEY]));
   } else {
     db = new SQL.Database();
-    applySchema();
   }
+  applySchema(); // always run; all statements use IF NOT EXISTS
+}
+
+async function ensureDb() {
+  if (db) return;
+  if (!dbReady) dbReady = _initDb();
+  await dbReady;
 }
 
 async function persistDb() {
@@ -146,10 +151,19 @@ async function handleMessage(cmd, payload) {
       return { ok: true, id };
     }
 
-    case 'delete_node':
-      sqlRun('DELETE FROM node WHERE id=?', [payload.id]);
+    case 'delete_node': {
+      // Cascade-delete all descendants
+      const toDelete = [payload.id];
+      const queue = [payload.id];
+      while (queue.length) {
+        const pid = queue.shift();
+        const kids = sqlQuery('SELECT id FROM node WHERE parent_id=?', [pid]);
+        kids.forEach(k => { toDelete.push(k.id); queue.push(k.id); });
+      }
+      toDelete.forEach(id => sqlRun('DELETE FROM node WHERE id=?', [id]));
       await persistDb();
       return { ok: true };
+    }
 
     case 'move_node':
       sqlRun(
@@ -185,6 +199,12 @@ async function handleMessage(cmd, payload) {
       await persistDb();
       return { ok: true, count: payload.nodes.length };
     }
+
+    case 'pre_open_tab':
+      // tree.js calls this before chrome.tabs.create so onTabCreated can adopt
+      // the existing saved-tab node instead of creating a duplicate
+      pendingAdopt = { nodeId: payload.nodeId, url: payload.url, ts: Date.now() };
+      return { ok: true };
 
     default:
       throw new Error(`Unknown command: ${cmd}`);
@@ -268,14 +288,26 @@ async function initialize() {
 
 async function onWindowCreated(win)  { await upsertWin(win); }
 
+function saveDescendantTabs(nodeId) {
+  // Recursively mark all tab descendants of nodeId as savedtab
+  const children = sqlQuery('SELECT id, node_type FROM node WHERE parent_id=?', [nodeId]);
+  for (const child of children) {
+    if (child.node_type === 'tab') {
+      sqlRun(
+        `UPDATE node SET node_type='savedtab', is_open=0, chrome_id=NULL, updated_at=datetime('now') WHERE id=?`,
+        [child.id]
+      );
+      saveDescendantTabs(child.id);
+    }
+  }
+}
+
 async function onWindowRemoved(winId) {
   await ensureDb();
-  sqlRun(
-    `UPDATE node SET node_type='savedtab', is_open=0, updated_at=datetime('now')
-     WHERE node_type='tab' AND parent_id=(
-       SELECT id FROM node WHERE node_type='win' AND chrome_id=? LIMIT 1)`,
-    [winId]
+  const winRows = sqlQuery(
+    `SELECT id FROM node WHERE node_type='win' AND chrome_id=? LIMIT 1`, [winId]
   );
+  if (winRows.length) saveDescendantTabs(winRows[0].id);
   sqlRun(
     `UPDATE node SET node_type='savedwin', is_open=0, chrome_id=NULL, updated_at=datetime('now')
      WHERE node_type='win' AND chrome_id=?`,
@@ -285,7 +317,30 @@ async function onWindowRemoved(winId) {
 }
 
 async function onTabCreated(tab) {
-  const pid = await winDbId(tab.windowId);
+  // Adopt a pending saved-tab node if tree.js called pre_open_tab first
+  if (pendingAdopt && (Date.now() - pendingAdopt.ts < 5000)) {
+    const { nodeId } = pendingAdopt;
+    pendingAdopt = null;
+    const pid = await winDbId(tab.windowId);
+    upsertNode({
+      id:          nodeId,
+      chrome_id:   tab.id,
+      is_open:     1,
+      node_type:   'tab',
+      parent_id:   pid,
+      title:       tab.title      ?? '',
+      url:         tab.url        ?? '',
+      favicon_url: tab.favIconUrl ?? '',
+      position:    tab.index      ?? 0,
+    });
+    await persistDb();
+    return;
+  }
+
+  // Place tab under its opener tab if one exists, otherwise under the window
+  let pid = null;
+  if (tab.openerTabId) pid = await tabDbId(tab.openerTabId);
+  if (pid == null)     pid = await winDbId(tab.windowId);
   await upsertTab(tab, pid);
 }
 
