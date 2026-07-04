@@ -78,33 +78,26 @@ tr:hover td { background: var(--hover); }
 </div>
 
 <script>
-const API = 'http://127.0.0.1:7779';
 let lastRows = [];
 
-async function ping() {
-  try {
-    const r = await fetch(API + '/health');
-    const j = await r.json();
-    if (j.ok) document.getElementById('backend-pill').textContent = 'connected';
-  } catch {
-    document.getElementById('backend-pill').textContent = 'disconnected';
-    setTimeout(ping, 3000);
-  }
+function bgSend(cmd, payload) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({ to: 'background', cmd, payload }, r => {
+      if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+      if (!r?.ok) return reject(new Error(r?.error ?? 'Unknown error'));
+      resolve(r.data);
+    });
+  });
 }
 
 async function runSQL(sql) {
   const t0 = Date.now();
   document.getElementById('status').textContent = 'Running…';
   try {
-    const r = await fetch(API + '/query', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({sql})
-    });
-    const j = await r.json();
+    const r = await bgSend('bulk_exec', { sql });
     const elapsed = Date.now() - t0;
-    if (!j.ok) throw new Error(j.error);
-    lastRows = j.rows || [];
+    if (!r.ok) throw new Error(r.error);
+    lastRows = r.rows ?? [];
     renderTable(lastRows);
     document.getElementById('status').textContent =
       `${lastRows.length} row${lastRows.length===1?'':'s'} · ${elapsed}ms`;
@@ -173,7 +166,7 @@ document.querySelectorAll('.sq').forEach(el => {
   });
 });
 
-ping();
+document.getElementById('backend-pill').textContent = 'in-browser sqlite';
 runSQL('SELECT node_type, COUNT(*) c FROM node GROUP BY node_type ORDER BY c DESC');
 </script>
 </body>

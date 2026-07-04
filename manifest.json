@@ -13,9 +13,7 @@
     "tabs",
     "windows",
     "storage",
-    "nativeMessaging",
-    "favicon",
-    "system.display",
+    "unlimitedStorage",
     "clipboardWrite"
   ],
   "commands": {
@@ -23,6 +21,9 @@
       "suggested_key": { "default": "Ctrl+Shift+E" },
       "description": "Open TabSQL"
     }
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
   },
   "web_accessible_resources": [{
     "resources": ["index.html", "management_ui.html"],
