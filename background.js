@@ -318,19 +318,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 async function upsertWin(chromeWin) {
   await ensureDb();
-  const id = upsertNode({
+  const existing = sqlQuery(
+    `SELECT id FROM node WHERE chrome_id=? AND node_type IN ('win','savedwin') LIMIT 1`,
+    [chromeWin.id]
+  )[0];
+  const node = {
     node_type: 'win',
     is_open:   1,
     chrome_id: chromeWin.id,
     win_rect:  `${chromeWin.left}_${chromeWin.top}_${chromeWin.width}_${chromeWin.height}`,
     relicons:  chromeWin.type ?? 'normal',
-  });
+  };
+  if (existing) node.id = existing.id;
+  const id = upsertNode(node);
   await persistDb();
   return id;
 }
 
 async function upsertTab(chromeTab, parentDbId) {
   await ensureDb();
+  const existing = sqlQuery(
+    `SELECT id FROM node WHERE chrome_id=? AND node_type IN ('tab','savedtab') LIMIT 1`,
+    [chromeTab.id]
+  )[0];
   const node = {
     node_type:   'tab',
     is_open:     1,
@@ -340,7 +350,11 @@ async function upsertTab(chromeTab, parentDbId) {
     favicon_url: chromeTab.favIconUrl ?? '',
     position:    chromeTab.index      ?? 0,
   };
-  if (parentDbId != null) node.parent_id = parentDbId;
+  if (existing) {
+    node.id = existing.id; // update in place, preserve parent/position set by user
+  } else if (parentDbId != null) {
+    node.parent_id = parentDbId;
+  }
   const id = upsertNode(node);
   await persistDb();
   return id;

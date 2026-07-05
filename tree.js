@@ -116,11 +116,17 @@ function buildTree(parentId = null, depth = 0) {
       faviconHtml = `<img class="favicon" src="${escHtml(n.favicon_url)}" onerror="this.style.display='none'">`;
     }
 
-    const saveBtn = (n.node_type === 'tab')
+    const editBtn  = `<button class="act act-edit" data-id="${n.id}" title="Edit note">✎</button>`;
+    const saveBtn  = (n.node_type === 'tab')
       ? `<button class="act act-save" data-id="${n.id}" title="Save &amp; close">💾</button>`
       : '';
-    const delBtn  = `<button class="act act-del" data-id="${n.id}" title="Delete">✕</button>`;
-    const actions = `<span class="actions">${saveBtn}${delBtn}</span>`;
+    const delBtn   = `<button class="act act-del" data-id="${n.id}" title="Delete">✕</button>`;
+    const actions  = `<span class="actions">${editBtn}${saveBtn}${delBtn}</span>`;
+    const noteRow  = `<div class="note-row${n.note_text ? '' : ' empty'}" data-note-for="${n.id}"
+                          style="padding-left:${indent + 20}px">
+                       <span class="note-bar">│</span>
+                       <span class="note-text">${escHtml(n.note_text || '')}</span>
+                     </div>`;
 
     const cls = ['node', isOpen && isTab ? 'open-tab' : '', n.id === selected ? 'selected' : '']
       .filter(Boolean).join(' ');
@@ -136,6 +142,7 @@ function buildTree(parentId = null, depth = 0) {
               ${winType}${badge}
               ${actions}
             </div>
+            ${noteRow}
             ${kidHtml}`;
   }).join('');
 }
@@ -153,16 +160,22 @@ function render(nodes, filter = '') {
       (n.custom_title||'').toLowerCase().includes(q)
     );
     treeEl.innerHTML = matched.map(n => {
-      const label = nodeLabel(n);
+      const label   = nodeLabel(n);
+      const editBtn = `<button class="act act-edit" data-id="${n.id}" title="Edit note">✎</button>`;
       const saveBtn = n.node_type === 'tab'
         ? `<button class="act act-save" data-id="${n.id}" title="Save &amp; close">💾</button>` : '';
+      const noteRow = `<div class="note-row${n.note_text ? '' : ' empty'}" data-note-for="${n.id}"
+                            style="padding-left:20px">
+                         <span class="note-bar">│</span>
+                         <span class="note-text">${escHtml(n.note_text || '')}</span>
+                       </div>`;
       return `<div class="node" data-id="${n.id}" data-type="${n.node_type}"
                    draggable="true" style="padding-left:4px" title="${escHtml(n.url || '')}">
                 <span class="toggle"></span>
                 <span class="icon">${nodeIcon(n)}</span>
                 <span class="label">${escHtml(label)}</span>
-                <span class="actions">${saveBtn}<button class="act act-del" data-id="${n.id}" title="Delete">✕</button></span>
-              </div>`;
+                <span class="actions">${editBtn}${saveBtn}<button class="act act-del" data-id="${n.id}" title="Delete">✕</button></span>
+              </div>${noteRow}`;
     }).join('');
     setStatus(`${matched.length} results`);
     return;
@@ -227,6 +240,48 @@ document.getElementById('tree').addEventListener('click', async e => {
   const id = +btn.dataset.id;
   const n  = nodeMap[id];
   if (!n) return;
+
+  if (btn.classList.contains('act-edit')) {
+    const noteRow = treeEl.querySelector(`.note-row[data-note-for="${id}"]`);
+    if (!noteRow || noteRow.classList.contains('editing')) return;
+    const current = nodeMap[id]?.note_text || '';
+    noteRow.classList.remove('empty');
+    noteRow.classList.add('editing');
+    noteRow.innerHTML = `<span class="note-bar">│</span>
+      <input class="note-input" value="${escHtml(current)}" placeholder="Add a note…">
+      <button class="act note-save" title="Save">✓</button>
+      <button class="act note-cancel" title="Cancel">✕</button>`;
+    const inp = noteRow.querySelector('.note-input');
+    inp.focus();
+    inp.addEventListener('keydown', e => {
+      if (e.key === 'Enter')  noteRow.querySelector('.note-save').click();
+      if (e.key === 'Escape') noteRow.querySelector('.note-cancel').click();
+    });
+    noteRow.querySelector('.note-save').addEventListener('click', async () => {
+      const val = noteRow.querySelector('.note-input').value.trim();
+      await db.upsertNode({ id, note_text: val || null });
+      if (nodeMap[id]) nodeMap[id].note_text = val || null;
+      noteRow.classList.remove('editing');
+      if (val) {
+        noteRow.classList.remove('empty');
+        noteRow.innerHTML = `<span class="note-bar">│</span><span class="note-text">${escHtml(val)}</span>`;
+      } else {
+        noteRow.classList.add('empty');
+        noteRow.innerHTML = `<span class="note-bar">│</span><span class="note-text"></span>`;
+      }
+    });
+    noteRow.querySelector('.note-cancel').addEventListener('click', () => {
+      noteRow.classList.remove('editing');
+      if (current) {
+        noteRow.classList.remove('empty');
+        noteRow.innerHTML = `<span class="note-bar">│</span><span class="note-text">${escHtml(current)}</span>`;
+      } else {
+        noteRow.classList.add('empty');
+        noteRow.innerHTML = `<span class="note-bar">│</span><span class="note-text"></span>`;
+      }
+    });
+    return;
+  }
 
   if (btn.classList.contains('act-save')) {
     // Close the Chrome tab; background.js onTabRemoved will mark it savedtab.
@@ -391,8 +446,6 @@ document.getElementById('search').addEventListener('input', e => {
 
 document.getElementById('btn-refresh').addEventListener('click', load);
 
-document.getElementById('btn-sql').addEventListener('click', () => toggleSqlPanel());
-
 // ── Live updates ──────────────────────────────────────────────────────────────
 
 let liveTimer = null;
@@ -466,23 +519,6 @@ function renderSqlTable(rows) {
   el.innerHTML = `<table><thead>${header}</thead><tbody>${body}</tbody></table>`;
 }
 
-async function toggleSqlPanel(show) {
-  const panel  = document.getElementById('sql-panel');
-  const opening = show !== undefined ? show : panel.classList.contains('hidden');
-  panel.classList.toggle('hidden', !opening);
-  if (!opening) return;
-  await loadQuickQueries();
-  const inp = document.getElementById('sql-input');
-  inp.focus();
-  if (!inp.value.trim()) {
-    // Run the first saved query automatically
-    const first = sqlQuickEl.options[1];
-    if (first?.dataset.sql) {
-      inp.value = first.dataset.sql;
-      runSQL(inp.value);
-    }
-  }
-}
 
 // ── Quick-query select ────────────────────────────────────────────────────────
 
@@ -564,8 +600,44 @@ document.getElementById('sql-input').addEventListener('keydown', e => {
   }
 });
 
-document.getElementById('sql-close').addEventListener('click', () => toggleSqlPanel(false));
+
+// ── SQL panel resize ──────────────────────────────────────────────────────────
+
+const sqlResizeEl = document.getElementById('sql-resize');
+const sqlPanelEl  = document.getElementById('sql-panel');
+const mainEl      = document.getElementById('main');
+let resizing      = false;
+let resizeStartY  = 0;
+let resizeStartH  = 0;
+
+sqlResizeEl.addEventListener('mousedown', e => {
+  resizing     = true;
+  resizeStartY = e.clientY;
+  resizeStartH = sqlPanelEl.getBoundingClientRect().height;
+  sqlResizeEl.classList.add('dragging');
+  e.preventDefault();
+});
+
+document.addEventListener('mousemove', e => {
+  if (!resizing) return;
+  const delta = resizeStartY - e.clientY;
+  const newH  = Math.max(60, Math.min(resizeStartH + delta, mainEl.clientHeight - 60));
+  sqlPanelEl.style.height = newH + 'px';
+});
+
+document.addEventListener('mouseup', () => {
+  if (!resizing) return;
+  resizing = false;
+  sqlResizeEl.classList.remove('dragging');
+});
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 load();
+loadQuickQueries().then(() => {
+  const first = sqlQuickEl.options[1];
+  if (first?.dataset.sql) {
+    document.getElementById('sql-input').value = first.dataset.sql;
+    runSQL(first.dataset.sql);
+  }
+});
