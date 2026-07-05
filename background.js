@@ -18,7 +18,8 @@ const DEFAULT_QUICK_QUERIES = [
 let SQL         = null;
 let db          = null;
 let dbReady     = null;   // promise — prevents concurrent init races
-let pendingAdopt = null;  // { nodeId, url, ts } — set by pre_open_tab message
+let pendingAdopt  = null;       // { nodeId, url, ts } — set by pre_open_tab message
+let adoptedTabIds = new Set(); // chrome tab IDs adopted by open_saved_window; skip in onTabCreated
 
 // ---------------------------------------------------------------------------
 // DB init & persistence
@@ -236,6 +237,25 @@ async function handleMessage(cmd, payload) {
       pendingAdopt = { nodeId: payload.nodeId, url: payload.url, ts: Date.now() };
       return { ok: true };
 
+    case 'open_saved_window': {
+      const savedTabs = sqlQuery(
+        `SELECT id, url, position FROM node WHERE parent_id=? AND node_type='savedtab' AND url IS NOT NULL ORDER BY position`,
+        [payload.winNodeId]
+      );
+      if (!savedTabs.length) return { ok: true };
+      const newWin = await chrome.windows.create({ url: savedTabs.map(t => t.url) });
+      // Update the savedwin node back to an open win
+      upsertNode({ id: payload.winNodeId, node_type: 'win', is_open: 1, chrome_id: newWin.id });
+      // Match created tabs 1:1 to saved nodes and mark them so onTabCreated skips them
+      const chromeTabs = newWin.tabs ?? [];
+      for (let i = 0; i < Math.min(savedTabs.length, chromeTabs.length); i++) {
+        upsertNode({ id: savedTabs[i].id, chrome_id: chromeTabs[i].id, is_open: 1, node_type: 'tab', position: i });
+        adoptedTabIds.add(chromeTabs[i].id);
+      }
+      await persistDb();
+      return { ok: true };
+    }
+
     case 'get_quick_queries': {
       const rows = sqlQuery('SELECT * FROM quick_query ORDER BY position, label');
       return { ok: true, rows };
@@ -359,41 +379,59 @@ async function initialize() {
 // Chrome event handlers
 // ---------------------------------------------------------------------------
 
-async function onWindowCreated(win)  { await upsertWin(win); }
-
-function saveDescendantTabs(nodeId) {
-  // Recursively mark all tab descendants of nodeId as savedtab
+// Returns true if nodeId has any savedtab descendant at any depth
+function hasSavedDescendants(nodeId) {
   const children = sqlQuery('SELECT id, node_type FROM node WHERE parent_id=?', [nodeId]);
   for (const child of children) {
-    if (child.node_type === 'tab') {
-      sqlRun(
-        `UPDATE node SET node_type='savedtab', is_open=0, chrome_id=NULL, updated_at=datetime('now') WHERE id=?`,
-        [child.id]
-      );
-      saveDescendantTabs(child.id);
+    if (child.node_type === 'savedtab') return true;
+    if (hasSavedDescendants(child.id)) return true;
+  }
+  return false;
+}
+
+// Delete open tab descendants, re-parenting any savedtab children up the tree
+function deleteOpenDescendants(nodeId, newParentId) {
+  const children = sqlQuery('SELECT id, node_type FROM node WHERE parent_id=?', [nodeId]);
+  for (const child of children) {
+    if (child.node_type === 'savedtab') {
+      // Promote saved tab to the grandparent so it isn't orphaned
+      sqlRun(`UPDATE node SET parent_id=? WHERE id=?`, [newParentId, child.id]);
+    } else if (child.node_type === 'tab') {
+      deleteOpenDescendants(child.id, newParentId ?? nodeId);
+      sqlRun('DELETE FROM node WHERE id=?', [child.id]);
     }
   }
 }
 
+async function onWindowCreated(win) { await upsertWin(win); }
+
 async function onWindowRemoved(winId) {
   await ensureDb();
-  const winRows = sqlQuery(
-    `SELECT id FROM node WHERE node_type='win' AND chrome_id=? LIMIT 1`, [winId]
-  );
-  if (winRows.length) saveDescendantTabs(winRows[0].id);
-  sqlRun(
-    `UPDATE node SET node_type='savedwin', is_open=0, chrome_id=NULL, updated_at=datetime('now')
-     WHERE node_type='win' AND chrome_id=?`,
-    [winId]
-  );
+  const winRow = sqlQuery(`SELECT id FROM node WHERE node_type='win' AND chrome_id=? LIMIT 1`, [winId])[0];
+  if (!winRow) return;
+  // onTabRemoved already fired for each tab; clean up any stragglers and re-parent saved content
+  deleteOpenDescendants(winRow.id, null);
+  if (hasSavedDescendants(winRow.id)) {
+    // Keep the window node as savedwin to preserve the saved tab group
+    sqlRun(`UPDATE node SET node_type='savedwin', is_open=0, chrome_id=NULL, updated_at=datetime('now') WHERE id=?`, [winRow.id]);
+  } else {
+    sqlRun('DELETE FROM node WHERE id=?', [winRow.id]);
+  }
   await persistDb();
 }
 
 async function onTabCreated(tab) {
-  // Adopt a pending saved-tab node if tree.js called pre_open_tab first
+  // Tab adopted by open_saved_window — already updated in the handler
+  if (adoptedTabIds.has(tab.id)) {
+    adoptedTabIds.delete(tab.id);
+    return;
+  }
+
+  // Adopt a pending saved-tab node (tree.js called pre_open_tab before chrome.tabs.create)
   if (pendingAdopt && (Date.now() - pendingAdopt.ts < 5000)) {
     const { nodeId } = pendingAdopt;
     pendingAdopt = null;
+    const savedPos = sqlQuery('SELECT position FROM node WHERE id=?', [nodeId])[0]?.position ?? -1;
     const pid = await winDbId(tab.windowId);
     upsertNode({
       id:          nodeId,
@@ -407,6 +445,10 @@ async function onTabCreated(tab) {
       position:    tab.index      ?? 0,
     });
     await persistDb();
+    // Restore the tab's original position in the tab bar
+    if (savedPos >= 0 && savedPos !== tab.index) {
+      try { await chrome.tabs.move(tab.id, { index: savedPos }); } catch {}
+    }
     return;
   }
 
@@ -417,14 +459,21 @@ async function onTabCreated(tab) {
   await upsertTab(tab, pid);
 }
 
-async function onTabRemoved(tabId, info) {
-  if (info.isWindowClosing) return;
+async function onTabRemoved(tabId, _info) {
+  // Always delete — only the manual 💾 button keeps tabs saved
   await ensureDb();
-  sqlRun(
-    `UPDATE node SET node_type='savedtab', is_open=0, chrome_id=NULL, updated_at=datetime('now')
-     WHERE node_type='tab' AND chrome_id=?`,
-    [tabId]
-  );
+  const row = sqlQuery(`SELECT id, parent_id FROM node WHERE node_type='tab' AND chrome_id=? LIMIT 1`, [tabId])[0];
+  if (!row) return;
+  // Re-parent any savedtab children so they aren't orphaned
+  sqlRun(`UPDATE node SET parent_id=? WHERE parent_id=? AND node_type='savedtab'`, [row.parent_id, row.id]);
+  sqlRun('DELETE FROM node WHERE id=?', [row.id]);
+  await persistDb();
+}
+
+async function onTabMoved(tabId, moveInfo) {
+  const id = await tabDbId(tabId);
+  if (id == null) return;
+  sqlRun(`UPDATE node SET position=?, updated_at=datetime('now') WHERE id=?`, [moveInfo.toIndex, id]);
   await persistDb();
 }
 
@@ -446,6 +495,7 @@ chrome.windows.onRemoved.addListener(guard(onWindowRemoved));
 chrome.tabs.onCreated.addListener(guard(onTabCreated));
 chrome.tabs.onRemoved.addListener(guard(onTabRemoved));
 chrome.tabs.onUpdated.addListener(guard(onTabUpdated));
+chrome.tabs.onMoved.addListener(guard(onTabMoved));
 
 // ---------------------------------------------------------------------------
 // UI

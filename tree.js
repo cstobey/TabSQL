@@ -192,7 +192,15 @@ document.getElementById('tree').addEventListener('click', e => {
   node.classList.add('selected');
 
   if (e.detail === 2) {
-    if (n?.is_open && n?.chrome_id) {
+    if (n?.node_type === 'win' && n?.chrome_id) {
+      // Focus open window
+      chrome.windows.update(n.chrome_id, { focused: true });
+    } else if (n?.node_type === 'savedwin') {
+      // Re-open all saved tabs in a new window, adopting the existing DB nodes
+      db.send('open_saved_window', { winNodeId: n.id })
+        .then(() => scheduleRefresh())
+        .catch(console.error);
+    } else if (n?.is_open && n?.chrome_id) {
       // Focus existing open tab
       chrome.tabs.get(n.chrome_id).then(tab => {
         chrome.tabs.update(n.chrome_id, { active: true });
