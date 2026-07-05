@@ -401,27 +401,23 @@ chrome.windows.onRemoved.addListener(scheduleRefresh);
 
 // ── SQL panel ─────────────────────────────────────────────────────────────────
 
-const SQL_QUICK = [
-  ['Node counts',    `SELECT node_type, COUNT(*) c FROM node GROUP BY node_type ORDER BY c DESC`],
-  ['Open tabs',      `SELECT * FROM node WHERE is_open=1 AND node_type='tab' ORDER BY position`],
-  ['Saved tabs',     `SELECT * FROM node WHERE node_type='savedtab' ORDER BY updated_at DESC LIMIT 100`],
-  ['Window summary', `SELECT * FROM window_summary ORDER BY tab_count DESC`],
-  ['Tab flat view',  `SELECT * FROM tab_flat LIMIT 100`],
-  ['Duplicate URLs', `SELECT url, COUNT(*) c FROM node WHERE url IS NOT NULL GROUP BY url HAVING c>1 ORDER BY c DESC`],
-  ['Recently added', `SELECT * FROM node ORDER BY created_at DESC LIMIT 50`],
-  ['All notes',      `SELECT * FROM node WHERE note_text IS NOT NULL ORDER BY updated_at DESC`],
-];
-
-// Populate quick-query select
 const sqlQuickEl = document.getElementById('sql-quick');
-SQL_QUICK.forEach(([label, sql]) => {
-  const opt = document.createElement('option');
-  opt.value = sql;
-  opt.textContent = label;
-  sqlQuickEl.appendChild(opt);
-});
+let sqlLastRows  = [];
 
-let sqlLastRows = [];
+// Load saved queries from DB and populate the <select>
+async function loadQuickQueries() {
+  const r    = await db.send('get_quick_queries');
+  const rows = r?.rows ?? [];
+  sqlQuickEl.innerHTML = '<option value="">Saved queries…</option>';
+  rows.forEach(q => {
+    const opt = document.createElement('option');
+    opt.value        = q.id;
+    opt.textContent  = q.label;
+    opt.dataset.sql  = q.sql;
+    opt.dataset.def  = q.is_default;
+    sqlQuickEl.appendChild(opt);
+  });
+}
 
 async function runSQL(sql) {
   const statusEl  = document.getElementById('sql-status');
@@ -429,7 +425,7 @@ async function runSQL(sql) {
   statusEl.textContent = 'Running…';
   const t0 = Date.now();
   try {
-    const r = await db.query(sql);
+    const r    = await db.query(sql);
     const rows = r?.rows ?? [];
     const elapsed = Date.now() - t0;
     sqlLastRows = rows;
@@ -462,27 +458,91 @@ function renderSqlTable(rows) {
   el.innerHTML = `<table><thead>${header}</thead><tbody>${body}</tbody></table>`;
 }
 
-function toggleSqlPanel(show) {
-  const panel = document.getElementById('sql-panel');
+async function toggleSqlPanel(show) {
+  const panel  = document.getElementById('sql-panel');
   const opening = show !== undefined ? show : panel.classList.contains('hidden');
   panel.classList.toggle('hidden', !opening);
-  if (opening) {
-    const inp = document.getElementById('sql-input');
-    inp.focus();
-    if (!inp.value.trim()) {
-      inp.value = SQL_QUICK[0][1];
+  if (!opening) return;
+  await loadQuickQueries();
+  const inp = document.getElementById('sql-input');
+  inp.focus();
+  if (!inp.value.trim()) {
+    // Run the first saved query automatically
+    const first = sqlQuickEl.options[1];
+    if (first?.dataset.sql) {
+      inp.value = first.dataset.sql;
       runSQL(inp.value);
     }
   }
 }
 
-sqlQuickEl.addEventListener('change', e => {
-  const sql = e.target.value;
-  if (!sql) return;
-  document.getElementById('sql-input').value = sql;
-  runSQL(sql);
-  e.target.value = '';
+// ── Quick-query select ────────────────────────────────────────────────────────
+
+sqlQuickEl.addEventListener('change', () => {
+  const opt = sqlQuickEl.options[sqlQuickEl.selectedIndex];
+  if (!opt?.dataset.sql) return;
+  document.getElementById('sql-input').value = opt.dataset.sql;
+  runSQL(opt.dataset.sql);
+  // Keep selection so the user can delete/update it
 });
+
+// ── Save current query ────────────────────────────────────────────────────────
+
+document.getElementById('sql-save-query').addEventListener('click', async () => {
+  const sql = document.getElementById('sql-input').value.trim();
+  if (!sql) return;
+
+  // If an existing query is selected, offer to update it
+  const selOpt = sqlQuickEl.options[sqlQuickEl.selectedIndex];
+  const selId  = selOpt?.value ? +selOpt.value : null;
+  const selLabel = selOpt?.textContent ?? '';
+
+  let label, id;
+  if (selId) {
+    // prompt pre-filled with existing label; empty = save as new
+    label = prompt(`Update "${selLabel}" or enter a new name to save a copy:`, selLabel);
+    if (label === null) return; // cancelled
+    id = (label.trim() === selLabel) ? selId : null; // same name → update; new name → insert
+    label = label.trim() || selLabel;
+  } else {
+    label = prompt('Query name:', '');
+    if (!label?.trim()) return;
+    id = null;
+  }
+
+  await db.send('save_quick_query', { id, label: label.trim(), sql });
+  await loadQuickQueries();
+  // Re-select the just-saved query
+  for (const opt of sqlQuickEl.options) {
+    if (opt.dataset.sql === sql && opt.textContent === label.trim()) {
+      sqlQuickEl.value = opt.value;
+      break;
+    }
+  }
+  document.getElementById('sql-status').textContent = id ? 'Updated.' : 'Saved.';
+});
+
+// ── Delete selected query ─────────────────────────────────────────────────────
+
+document.getElementById('sql-del-query').addEventListener('click', async () => {
+  const id = +sqlQuickEl.value;
+  if (!id) return;
+  await db.send('delete_quick_query', { id });
+  await loadQuickQueries();
+  document.getElementById('sql-status').textContent = 'Deleted.';
+});
+
+// ── Restore defaults ──────────────────────────────────────────────────────────
+
+document.getElementById('sql-restore-defaults').addEventListener('click', async () => {
+  const r = await db.send('seed_default_queries');
+  await loadQuickQueries();
+  const added = r?.added ?? 0;
+  document.getElementById('sql-status').textContent =
+    added > 0 ? `${added} default${added > 1 ? 's' : ''} restored.` : 'All defaults already present.';
+});
+
+// ── Run / keyboard ────────────────────────────────────────────────────────────
 
 document.getElementById('sql-run').addEventListener('click', () => {
   const sql = document.getElementById('sql-input').value.trim();

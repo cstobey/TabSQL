@@ -3,6 +3,18 @@
 importScripts('sql-wasm.js');
 
 const DB_KEY = 'tabsql_db_v1';
+
+const DEFAULT_QUICK_QUERIES = [
+  { label: 'Node counts',    sql: `SELECT node_type, COUNT(*) c FROM node GROUP BY node_type ORDER BY c DESC` },
+  { label: 'Open tabs',      sql: `SELECT * FROM node WHERE is_open=1 AND node_type='tab' ORDER BY position` },
+  { label: 'Saved tabs',     sql: `SELECT * FROM node WHERE node_type='savedtab' ORDER BY updated_at DESC LIMIT 100` },
+  { label: 'Window summary', sql: `SELECT * FROM window_summary ORDER BY tab_count DESC` },
+  { label: 'Tab flat view',  sql: `SELECT * FROM tab_flat LIMIT 100` },
+  { label: 'Duplicate URLs', sql: `SELECT url, COUNT(*) c FROM node WHERE url IS NOT NULL GROUP BY url HAVING c>1 ORDER BY c DESC` },
+  { label: 'Recently added', sql: `SELECT * FROM node ORDER BY created_at DESC LIMIT 50` },
+  { label: 'All notes',      sql: `SELECT * FROM node WHERE note_text IS NOT NULL ORDER BY updated_at DESC` },
+];
+
 let SQL         = null;
 let db          = null;
 let dbReady     = null;   // promise — prevents concurrent init races
@@ -78,7 +90,27 @@ function applySchema() {
       LEFT JOIN node t ON t.parent_id = w.id AND t.node_type IN ('tab','savedtab')
       WHERE w.node_type IN ('win','savedwin')
       GROUP BY w.id;
+    CREATE TABLE IF NOT EXISTS quick_query (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      label      TEXT    NOT NULL,
+      sql        TEXT    NOT NULL,
+      position   INTEGER NOT NULL DEFAULT 0,
+      is_default INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_qquery_pos ON quick_query (position);
   `);
+  // Seed defaults on first creation (empty table)
+  const count = sqlQuery('SELECT COUNT(*) c FROM quick_query')[0]?.c ?? 0;
+  if (+count === 0) seedDefaultQueries();
+}
+
+function seedDefaultQueries() {
+  DEFAULT_QUICK_QUERIES.forEach((q, i) => {
+    sqlInsert(
+      'INSERT INTO quick_query (label, sql, position, is_default) VALUES (?,?,?,1)',
+      [q.label, q.sql, i]
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -201,10 +233,51 @@ async function handleMessage(cmd, payload) {
     }
 
     case 'pre_open_tab':
-      // tree.js calls this before chrome.tabs.create so onTabCreated can adopt
-      // the existing saved-tab node instead of creating a duplicate
       pendingAdopt = { nodeId: payload.nodeId, url: payload.url, ts: Date.now() };
       return { ok: true };
+
+    case 'get_quick_queries': {
+      const rows = sqlQuery('SELECT * FROM quick_query ORDER BY position, label');
+      return { ok: true, rows };
+    }
+
+    case 'save_quick_query': {
+      const { id, label, sql } = payload;
+      if (id) {
+        sqlRun('UPDATE quick_query SET label=?, sql=? WHERE id=?', [label, sql, id]);
+      } else {
+        const maxPos = sqlQuery('SELECT MAX(position) m FROM quick_query')[0]?.m ?? -1;
+        sqlInsert(
+          'INSERT INTO quick_query (label, sql, position, is_default) VALUES (?,?,?,0)',
+          [label, sql, maxPos + 1]
+        );
+      }
+      await persistDb();
+      return { ok: true };
+    }
+
+    case 'delete_quick_query':
+      sqlRun('DELETE FROM quick_query WHERE id=?', [payload.id]);
+      await persistDb();
+      return { ok: true };
+
+    case 'seed_default_queries': {
+      const existing = new Set(
+        sqlQuery('SELECT label FROM quick_query').map(r => r.label)
+      );
+      let added = 0;
+      DEFAULT_QUICK_QUERIES.forEach((q, i) => {
+        if (!existing.has(q.label)) {
+          sqlInsert(
+            'INSERT INTO quick_query (label, sql, position, is_default) VALUES (?,?,?,1)',
+            [q.label, q.sql, i]
+          );
+          added++;
+        }
+      });
+      await persistDb();
+      return { ok: true, added };
+    }
 
     default:
       throw new Error(`Unknown command: ${cmd}`);

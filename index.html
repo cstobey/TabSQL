@@ -46,7 +46,7 @@
   #sql-bar   { display: flex; align-items: center; gap: 6px; padding: 4px 8px;
                background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
   #sql-bar span.label { font-size: 11px; color: var(--accent); font-weight: 600; }
-  #sql-quick { flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  #sql-quick { width: 180px; background: var(--bg); border: 1px solid var(--border); color: var(--text);
                border-radius: 4px; padding: 2px 6px; font-size: 11px; }
   #sql-status { font-size: 11px; color: var(--muted); white-space: nowrap; }
   #sql-input { flex-shrink: 0; background: var(--surface); border: none;
@@ -123,10 +123,15 @@
   <div id="sql-panel" class="hidden">
     <div id="sql-bar">
       <span class="label">SQL</span>
-      <select id="sql-quick"><option value="">Quick queries…</option></select>
-      <button class="btn" id="sql-run">▶ Run</button>
-      <span id="sql-status"></span>
-      <button class="btn" id="sql-close">✕</button>
+      <select id="sql-quick"><option value="">Saved queries…</option></select>
+      <button class="btn" id="sql-save-query" title="Save / update query">＋</button>
+      <button class="btn" id="sql-del-query"  title="Delete selected query">－</button>
+      <button class="btn" id="sql-restore-defaults" title="Restore missing defaults">↺</button>
+      <div style="margin-left:auto;display:flex;align-items:center;gap:6px">
+        <button class="btn" id="sql-run">▶ Run</button>
+        <span id="sql-status"></span>
+        <button class="btn" id="sql-close">✕</button>
+      </div>
     </div>
     <textarea id="sql-input" spellcheck="false"
       placeholder="SELECT * FROM node LIMIT 20;  -- Ctrl+Enter to run"></textarea>
