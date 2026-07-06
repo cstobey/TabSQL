@@ -1,118 +1,124 @@
 # TabSQL
 
-TabSQL — Tab Outliner clone with SQLite/MariaDB backend, native messaging host, and SQL management console.
+A Chrome extension that manages browser tabs in a persistent tree view, backed by an in-browser SQLite database (sql.js / WASM). No server, no native host — everything runs inside the extension.
 
-## Structure
+## Features
 
-All files live flat in the project root (load the root folder as the unpacked extension):
+- **Tree view** of all open windows and tabs, with drag-and-drop reorganization
+- **Saved tabs** — manually save a tab (`💾`) to keep it after closing; it stays in the tree as a saved node and can be re-opened later
+- **Saved windows** — when a window closes, it converts to a saved window if it has saved tab children; double-click to reopen all tabs
+- **Notes** — attach a note to any node via the `✎` button; displayed inline below the node
+- **SQL console** — always-visible, resizable SQL panel at the bottom; run arbitrary queries against the live database
+- **Saved queries** — persist frequently-used SQL queries; restore built-in defaults at any time
+- **Opener hierarchy** — tabs opened from other tabs are nested under their opener
+- **Tab position sync** — tab bar position is tracked and restored when a saved tab is reopened
+- **Live updates** — tree refreshes automatically as tabs are opened/closed/moved
+
+## File structure
 
 ```
 TabSQL/
-  manifest.json              # Chrome extension manifest
-  background.js              # MV3 service worker
-  index.html                 # sidebar UI
-  tree.js                    # sidebar logic
-  management_ui.html         # SQL console (open in browser)
-  host.py                    # native messaging host + HTTP server
-  config.json                # backend config (edit before running)
-  base.py                    # abstract DB backend
-  sqlite.py
-  mariadb.py
-  factory.py
-  migrate.py                 # import Tab Outliner .tree exports
-  schema_sqlite.sql
-  schema_mariadb.sql
-  com.tabsql.host.json       # Chrome native messaging manifest
-  host_wrapper.bat           # launched by Chrome on Windows
-  install_host.ps1           # one-shot Windows install script
+  manifest.json        Chrome extension manifest (MV3)
+  background.js        Service worker — all DB logic and Chrome event handling
+  index.html           Sidebar UI shell and all CSS
+  tree.js              Sidebar UI logic
+  management_ui.html   Standalone SQL console (legacy, still functional)
+  sql-wasm.js          sql.js library
+  sql-wasm.wasm        SQLite compiled to WASM
 ```
 
-## Setup (Windows 11)
+## Setup
 
-### 1. Migrate your data
-
-```cmd
-cd C:\TabSQL
-python migrate.py --tree path\to\tree-exported-Wed-Jun-17-2026.tree
-```
-
-For MariaDB, edit `daemon/config.json` first:
-```json
-{ "backend": "mariadb", "mariadb": { "user": "...", "password": "..." } }
-```
-Then: `pip install pymysql`
-
-### 2. Load the extension
+### 1. Load the extension
 
 - Open `chrome://extensions`
-- Enable **Developer mode**
-- **Load unpacked** → select the `TabSQL/` folder itself (the project root)
-- Note the **Extension ID** (32-char string)
+- Enable **Developer mode** (top right)
+- Click **Load unpacked** → select the `TabSQL/` folder
+- Click the TabSQL icon in the toolbar to open the sidebar
 
-### 3. Install native messaging host
+The sidebar opens as a popup window. Use `Ctrl+Shift+E` to open it from the keyboard.
 
-```powershell
-# Run in PowerShell (no admin needed)
-cd C:\TabSQL\
-.\install_host.ps1 -ExtensionId "YOUR_EXTENSION_ID_HERE" -InstallDir "C:\TabSQL"
-```
+### 2. That's it
 
-This writes the registry key Chrome looks for at:
-`HKCU\Software\Google\Chrome\NativeMessagingHosts\com.tabsql.host`
+No server to start, no install script. The database is created automatically in `chrome.storage.local` on first run and persists across browser restarts.
 
-Edit `host_wrapper.bat` if your Python path differs from `C:\Python312\python.exe`.
+## Usage
 
-### 4. Verify
+### Tree navigation
 
-Restart Chrome. Click the TabSQL icon — the sidebar should open and load your tree.
+| Action | Result |
+|---|---|
+| Click a node | Select it |
+| Click `▼ / ▶` | Collapse / expand children |
+| Double-click a tab | Focus it (or reopen if saved) |
+| Double-click a window | Focus it (or reopen all saved tabs) |
+| Drag a node | Move it to a new parent; drag left to dedent |
+| Hover a node | Reveals `✎` (edit note), `💾` (save tab), `✕` (delete) |
+| Right-click | Context menu (open, copy URL/title, delete) |
 
-The daemon also serves a management HTTP API on `http://127.0.0.1:7779`.
-Open `management_ui.html` in a browser for the SQL console.
+### Saving tabs
 
-## Backend switching
+Tabs are **not** saved automatically when closed — closing a tab from Chrome deletes it from the tree. To keep a tab, click `💾` first. This closes the Chrome tab and converts it to a saved node that persists in the tree.
 
-Edit `daemon/config.json`:
-```json
-{ "backend": "sqlite" }    ← default, zero-config
-{ "backend": "mariadb" }   ← Docker MariaDB
-```
+### SQL console
 
-No code changes. Both backends implement the same interface.
+The SQL panel is always visible at the bottom of the sidebar. Drag the divider to resize it. Use `Ctrl+Enter` to run a query.
 
-## Ad-hoc querying (ksh/Python)
+The `＋` button saves the current query; `－` deletes the selected one; `↺` restores any missing built-in defaults.
 
-SQLite:
-```sh
-sqlite3 ~/tabsql.db "SELECT * FROM window_summary"
-```
+### Built-in queries
 
-MariaDB:
-```sh
-mysql -u tabsql -p tabsql -e "SELECT * FROM window_summary"
-```
+| Query | What it shows |
+|---|---|
+| Node counts | Row counts by node_type |
+| Open tabs | All currently-open tabs by position |
+| Saved tabs | Recently saved tabs |
+| Window summary | Windows with open/total tab counts |
+| Tab flat view | Tabs joined with their parent info |
+| Duplicate URLs | URLs that appear more than once |
+| Recently added | 50 most recently created nodes |
+| All notes | Nodes with note text |
 
-HTTP (daemon must be running):
-```sh
-curl -s -X POST http://127.0.0.1:7779/query \
-  -H 'Content-Type: application/json' \
-  -d '{"sql":"SELECT node_type, COUNT(*) c FROM node GROUP BY node_type"}' | python3 -m json.tool
-```
-
-## Useful queries
+## Useful SQL
 
 ```sql
--- All open windows with tab counts
+-- Open windows with tab counts
 SELECT * FROM window_summary WHERE is_open=1;
 
+-- Find tabs on a specific domain
+SELECT title, url FROM node WHERE url LIKE '%github.com%' AND is_open=1;
+
 -- Duplicate URLs
-SELECT url, COUNT(*) c FROM node WHERE url IS NOT NULL
-GROUP BY url HAVING c > 1 ORDER BY c DESC;
+SELECT url, COUNT(*) c FROM node
+WHERE url IS NOT NULL GROUP BY url HAVING c > 1 ORDER BY c DESC;
 
--- Bulk retitle a domain
-UPDATE node SET custom_title = REPLACE(title, 'Old Corp', 'New Corp')
-WHERE url LIKE '%oldcorp.com%';
+-- Bulk retitle
+UPDATE node SET custom_title = REPLACE(title, 'Old Name', 'New Name')
+WHERE url LIKE '%example.com%';
 
--- Delete empty saved windows
+-- Clean up empty saved windows
 DELETE FROM node WHERE node_type='savedwin'
   AND id NOT IN (SELECT DISTINCT parent_id FROM node WHERE parent_id IS NOT NULL);
+
+-- All nodes with notes
+SELECT id, node_type, title, note_text FROM node
+WHERE note_text IS NOT NULL ORDER BY updated_at DESC;
 ```
+
+## Data model
+
+All data lives in a single `node` table. Every tab, window, group, and note is a row.
+
+```
+node_type   chrome_id   is_open   meaning
+─────────────────────────────────────────────────────────
+win         set         1         open Chrome window
+savedwin    NULL        0         closed window (has saved children)
+tab         set         1         open Chrome tab
+savedtab    NULL        0         saved (closed) tab
+group       NULL        0         user-defined folder
+textnote    NULL        0         freeform note
+session     NULL        0         root container node
+```
+
+Tree structure is stored via `parent_id`. Position within a parent is stored as `position` (integer, 0-based). The `chrome_id` column maps DB nodes to live Chrome windows/tabs.
