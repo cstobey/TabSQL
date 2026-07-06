@@ -120,6 +120,27 @@
   /* Resize handle */
   #sql-resize { height: 5px; background: var(--border); cursor: row-resize; flex-shrink: 0; }
   #sql-resize:hover, #sql-resize.dragging { background: var(--accent); opacity: .8; }
+
+  /* Config panel */
+  #config-panel { background: var(--surface); border-bottom: 2px solid var(--accent); overflow-y: auto; max-height: 55vh; flex-shrink: 0; }
+  #config-panel.hidden { display: none; }
+  .cfg-section { border-bottom: 1px solid var(--border); }
+  .cfg-section:last-child { border-bottom: none; }
+  .cfg-hdr { display: flex; align-items: center; gap: 6px; padding: 5px 8px; cursor: pointer;
+             font-size: 11px; font-weight: 600; color: var(--accent); user-select: none; }
+  .cfg-hdr::before { content: '▼'; font-size: 9px; }
+  .cfg-hdr.collapsed::before { content: '▶'; }
+  .cfg-hdr:hover { background: var(--hover); }
+  .cfg-body { padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+  .cfg-body.hidden { display: none; }
+  .cfg-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .cfg-lbl { font-size: 11px; color: var(--muted); }
+  #cfg-io-status { font-size: 11px; color: var(--muted); }
+  .cfg-colors-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
+  .cfg-color-row { display: flex; align-items: center; gap: 6px; }
+  .cfg-color-row label { font-size: 11px; color: var(--text); flex: 1; min-width: 0; }
+  .cfg-color-row input[type=color] { width: 32px; height: 20px; border: 1px solid var(--border);
+    border-radius: 3px; cursor: pointer; padding: 1px; background: none; flex-shrink: 0; }
 </style>
 </head>
 <body>
@@ -127,6 +148,37 @@
 <div id="toolbar">
   <input id="search" type="search" placeholder="Search…" autocomplete="off">
   <button class="btn" id="btn-refresh" title="Reload tree">↺</button>
+  <button class="btn" id="btn-config" title="Settings">⚙</button>
+</div>
+
+<div id="config-panel" class="hidden">
+  <div class="cfg-section">
+    <div class="cfg-hdr" data-target="cfg-io-body">Import / Export</div>
+    <div id="cfg-io-body" class="cfg-body">
+      <div class="cfg-row">
+        <label class="cfg-lbl">Format</label>
+        <select id="cfg-format" class="btn" style="padding:2px 6px">
+          <option value="taboutliner">TabOutliner (.tree)</option>
+          <option value="sql">SQL (.sql)</option>
+        </select>
+      </div>
+      <div class="cfg-row">
+        <button class="btn" id="cfg-import">⬆ Import…</button>
+        <button class="btn" id="cfg-export">⬇ Export</button>
+        <input type="file" id="cfg-file-input" style="display:none" accept=".tree,.sql,.txt">
+      </div>
+      <div id="cfg-io-status"></div>
+    </div>
+  </div>
+  <div class="cfg-section">
+    <div class="cfg-hdr" data-target="cfg-colors-body">Colors</div>
+    <div id="cfg-colors-body" class="cfg-body">
+      <div id="cfg-colors-grid" class="cfg-colors-grid"></div>
+      <div class="cfg-row" style="margin-top:4px">
+        <button class="btn" id="cfg-colors-reset">Reset defaults</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div id="main">

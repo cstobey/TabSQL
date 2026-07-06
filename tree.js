@@ -631,6 +631,300 @@ document.addEventListener('mouseup', () => {
   sqlResizeEl.classList.remove('dragging');
 });
 
+// ── Config panel ──────────────────────────────────────────────────────────────
+
+const COLOR_VARS = [
+  { prop: '--bg',        label: 'Background',  def: '#1e1e2e' },
+  { prop: '--surface',   label: 'Surface',     def: '#2a2a3e' },
+  { prop: '--border',    label: 'Border',      def: '#3a3a5a' },
+  { prop: '--accent',    label: 'Accent',      def: '#7c9ef8' },
+  { prop: '--text',      label: 'Text',        def: '#cdd6f4' },
+  { prop: '--muted',     label: 'Muted text',  def: '#6e6e8e' },
+  { prop: '--hover',     label: 'Row hover',   def: '#313145' },
+  { prop: '--win-icon',  label: 'Window icon', def: '#f9c74f' },
+  { prop: '--tab-icon',  label: 'Tab icon',    def: '#90e0ef' },
+  { prop: '--note-icon', label: 'Note icon',   def: '#a8dadc' },
+];
+
+const THEME_KEY = 'tabsql_theme';
+
+async function loadTheme() {
+  const stored = await chrome.storage.local.get(THEME_KEY);
+  const theme  = stored[THEME_KEY] ?? {};
+  COLOR_VARS.forEach(cv => {
+    document.documentElement.style.setProperty(cv.prop, theme[cv.prop] ?? cv.def);
+  });
+  return theme;
+}
+
+function buildColorGrid(theme) {
+  const grid = document.getElementById('cfg-colors-grid');
+  grid.innerHTML = '';
+  COLOR_VARS.forEach(cv => {
+    const val = theme[cv.prop] ?? cv.def;
+    const row = document.createElement('div');
+    row.className = 'cfg-color-row';
+    row.innerHTML = `<label>${cv.label}</label><input type="color" data-prop="${cv.prop}" value="${val}">`;
+    grid.appendChild(row);
+  });
+  grid.querySelectorAll('input[type=color]').forEach(inp => {
+    inp.addEventListener('input', async () => {
+      document.documentElement.style.setProperty(inp.dataset.prop, inp.value);
+      const stored = await chrome.storage.local.get(THEME_KEY);
+      const t = stored[THEME_KEY] ?? {};
+      t[inp.dataset.prop] = inp.value;
+      await chrome.storage.local.set({ [THEME_KEY]: t });
+    });
+  });
+}
+
+document.getElementById('btn-config').addEventListener('click', () => {
+  document.getElementById('config-panel').classList.toggle('hidden');
+});
+
+document.querySelectorAll('.cfg-hdr').forEach(hdr => {
+  hdr.addEventListener('click', () => {
+    const body = document.getElementById(hdr.dataset.target);
+    hdr.classList.toggle('collapsed', body.classList.toggle('hidden'));
+  });
+});
+
+document.getElementById('cfg-colors-reset').addEventListener('click', async () => {
+  await chrome.storage.local.remove(THEME_KEY);
+  COLOR_VARS.forEach(cv => document.documentElement.style.setProperty(cv.prop, cv.def));
+  buildColorGrid({});
+});
+
+// ── Import / Export ───────────────────────────────────────────────────────────
+
+const TO_NODE_INSERT = 2001;
+const TO_EOF_OP      = 11111;
+
+function cfgStatus(msg) {
+  document.getElementById('cfg-io-status').textContent = msg;
+}
+
+function downloadFile(filename, content, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+document.getElementById('cfg-import').addEventListener('click', () => {
+  document.getElementById('cfg-file-input').click();
+});
+
+document.getElementById('cfg-file-input').addEventListener('change', async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const text = await file.text();
+  const fmt  = document.getElementById('cfg-format').value;
+  cfgStatus('Importing…');
+  try {
+    if (fmt === 'taboutliner') await importTabOutliner(text);
+    else                       await importSQL(text);
+    await load();
+    cfgStatus('Import complete.');
+  } catch (err) {
+    cfgStatus('Error: ' + err.message);
+    console.error(err);
+  }
+  e.target.value = '';
+});
+
+document.getElementById('cfg-export').addEventListener('click', async () => {
+  const fmt = document.getElementById('cfg-format').value;
+  cfgStatus('Exporting…');
+  try {
+    if (fmt === 'taboutliner') await exportTabOutliner();
+    else                       await exportSQL();
+    cfgStatus('Export complete.');
+  } catch (err) {
+    cfgStatus('Error: ' + err.message);
+    console.error(err);
+  }
+});
+
+// ── TabOutliner import (mirrors migrate.py logic) ─────────────────────────────
+
+function parseTabOutlinerNode(raw) {
+  const ntype  = raw.type ?? 'savedtab';
+  const marks  = raw.marks ?? {};
+  const data   = raw.data  ?? {};
+  return {
+    node_type:      ntype,
+    is_collapsed:   raw.colapsed ? 1 : 0,
+    is_open:        (ntype === 'win' || ntype === 'tab') ? 1 : 0,
+    title:          data.title        ?? null,
+    url:            data.url          ?? null,
+    favicon_url:    data.favIconUrl   ?? null,
+    note_text:      data.note         ?? null,
+    custom_title:   marks.customTitle       ?? null,
+    custom_favicon: marks.customFavicon     ?? null,
+    color_active:   marks.customColorActive ?? null,
+    color_saved:    marks.customColorSaved  ?? null,
+    relicons:       marks.relicons ? JSON.stringify(marks.relicons) : null,
+    win_rect:       data.rect ?? null,
+    chrome_id:      null,
+  };
+}
+
+async function importTabOutliner(text) {
+  const raw = JSON.parse(text);
+  if (!Array.isArray(raw)) throw new Error('Expected a JSON array');
+
+  const pathToId   = {};
+  const posCounter = {};
+
+  for (const item of raw) {
+    if (!Array.isArray(item)) continue;
+    if (item[0] !== TO_NODE_INSERT) continue;
+    if (item.length < 3) continue;
+
+    const path      = item[2];
+    const pathKey   = path.join(',');
+    const parentKey = path.slice(0, -1).join(',');
+
+    if (posCounter[parentKey] === undefined) posCounter[parentKey] = 0;
+
+    const node = parseTabOutlinerNode(item[1]);
+    node.parent_id = pathToId[parentKey] ?? null;
+    node.position  = posCounter[parentKey]++;
+
+    const cleaned = Object.fromEntries(Object.entries(node).filter(([, v]) => v != null));
+    const result  = await db.send('upsert_node', { node: cleaned });
+    pathToId[pathKey] = result?.id;
+  }
+}
+
+// ── TabOutliner export ────────────────────────────────────────────────────────
+
+async function exportTabOutliner() {
+  const r     = await db.query('SELECT * FROM node ORDER BY parent_id NULLS FIRST, position');
+  const nodes = r?.rows ?? [];
+
+  function toToNode(n) {
+    const marks = {};
+    if (n.custom_title)   marks.customTitle        = n.custom_title;
+    if (n.custom_favicon) marks.customFavicon      = n.custom_favicon;
+    if (n.color_active)   marks.customColorActive  = n.color_active;
+    if (n.color_saved)    marks.customColorSaved   = n.color_saved;
+    if (n.relicons) { try { marks.relicons = JSON.parse(n.relicons); } catch {} }
+    const data = {};
+    if (n.title)       data.title      = n.title;
+    if (n.url)         data.url        = n.url;
+    if (n.favicon_url) data.favIconUrl = n.favicon_url;
+    if (n.note_text)   data.note       = n.note_text;
+    if (n.win_rect)    data.rect       = n.win_rect;
+    return { type: n.node_type, colapsed: !!n.is_collapsed, data, marks };
+  }
+
+  const result = [{ type: 'TREE_CREATE', treeStorage: 'TabSQL export' }];
+
+  function traverse(parentId, pathSoFar) {
+    nodes.filter(n => n.parent_id == parentId)
+         .sort((a, b) => a.position - b.position)
+         .forEach((n, i) => {
+           const path = [...pathSoFar, i];
+           result.push([TO_NODE_INSERT, toToNode(n), path]);
+           traverse(n.id, path);
+         });
+  }
+
+  const session = nodes.find(n => n.node_type === 'session');
+  traverse(session ? session.id : null, []);
+  result.push([TO_EOF_OP]);
+
+  downloadFile('tabsql-export.tree', JSON.stringify(result, null, 2), 'application/json');
+}
+
+// ── SQL import ────────────────────────────────────────────────────────────────
+
+async function importSQL(text) {
+  const stripped   = text.replace(/\/\*[\s\S]*?\*\//g, '');
+  const statements = stripped.split(';').map(s => s.trim()).filter(Boolean);
+  for (const sql of statements) {
+    await db.send('exec_raw', { sql });
+  }
+}
+
+// ── SQL export ────────────────────────────────────────────────────────────────
+
+const SQL_DDL_COMMENT = `/*
+CREATE TABLE IF NOT EXISTS node (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_id      INTEGER REFERENCES node(id),
+  node_type      TEXT    NOT NULL,
+  position       INTEGER NOT NULL DEFAULT 0,
+  is_collapsed   INTEGER NOT NULL DEFAULT 0,
+  is_open        INTEGER NOT NULL DEFAULT 0,
+  chrome_id      INTEGER DEFAULT NULL,
+  title          TEXT,
+  url            TEXT,
+  favicon_url    TEXT,
+  note_text      TEXT,
+  custom_title   TEXT,
+  custom_favicon TEXT,
+  color_active   TEXT,
+  color_saved    TEXT,
+  relicons       TEXT,
+  win_rect       TEXT,
+  created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_parent ON node (parent_id, position);
+CREATE INDEX IF NOT EXISTS idx_chrome ON node (chrome_id);
+CREATE INDEX IF NOT EXISTS idx_type   ON node (node_type);
+CREATE VIEW IF NOT EXISTS tab_flat AS
+  SELECT n.id, n.node_type, n.title, n.url, n.favicon_url,
+         n.is_open, n.is_collapsed, n.position,
+         n.custom_title, n.color_active, n.color_saved,
+         p.id AS parent_id, p.title AS parent_title, p.node_type AS parent_type,
+         n.created_at, n.updated_at
+  FROM node n LEFT JOIN node p ON n.parent_id = p.id
+  WHERE n.node_type IN ('tab','savedtab');
+CREATE VIEW IF NOT EXISTS window_summary AS
+  SELECT w.id, w.node_type,
+         COALESCE(w.custom_title, w.title, 'Untitled') AS title,
+         w.is_open, w.is_collapsed, w.win_rect, w.custom_favicon,
+         COUNT(t.id) AS tab_count, SUM(t.is_open) AS open_tab_count
+  FROM node w
+  LEFT JOIN node t ON t.parent_id = w.id AND t.node_type IN ('tab','savedtab')
+  WHERE w.node_type IN ('win','savedwin')
+  GROUP BY w.id;
+CREATE TABLE IF NOT EXISTS quick_query (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  label      TEXT    NOT NULL,
+  sql        TEXT    NOT NULL,
+  position   INTEGER NOT NULL DEFAULT 0,
+  is_default INTEGER NOT NULL DEFAULT 0
+);
+*/`;
+
+async function exportSQL() {
+  const r     = await db.query('SELECT * FROM node ORDER BY id');
+  const nodes = r?.rows ?? [];
+
+  const cols = ['id','parent_id','node_type','position','is_collapsed','is_open',
+                'chrome_id','title','url','favicon_url','note_text','custom_title',
+                'custom_favicon','color_active','color_saved','relicons','win_rect',
+                'created_at','updated_at'];
+
+  function sqlVal(v) {
+    if (v === null || v === undefined) return 'NULL';
+    if (typeof v === 'number') return String(v);
+    return `'${String(v).replace(/'/g, "''")}'`;
+  }
+
+  const inserts = nodes.map(n =>
+    `INSERT OR REPLACE INTO node (${cols.join(', ')}) VALUES (${cols.map(c => sqlVal(n[c])).join(', ')});`
+  );
+
+  downloadFile('tabsql-export.sql', [SQL_DDL_COMMENT, '', ...inserts].join('\n'), 'text/plain');
+}
+
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 load();
@@ -641,3 +935,4 @@ loadQuickQueries().then(() => {
     runSQL(first.dataset.sql);
   }
 });
+loadTheme().then(theme => buildColorGrid(theme));

@@ -281,6 +281,12 @@ async function handleMessage(cmd, payload) {
       await persistDb();
       return { ok: true };
 
+    case 'exec_raw': {
+      db.exec(payload.sql);
+      await persistDb();
+      return { ok: true };
+    }
+
     case 'seed_default_queries': {
       const existing = new Set(
         sqlQuery('SELECT label FROM quick_query').map(r => r.label)
