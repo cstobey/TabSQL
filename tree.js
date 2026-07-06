@@ -24,26 +24,45 @@ const db = {
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-let allNodes = [];
-let nodeMap  = {};
-let collapsed = new Set();
-let selected  = null;
-let dragSrcId = null;
+let allNodes    = [];
+let nodeMap     = {};
+let collapsed   = new Set();
+let selected    = null;
+let dragSrcId   = null;
+let allTags     = [];          // [{id, name, color}]
+let nodeTagsMap = {};          // nodeId → [{id, name, color}]
+let tagPickerNodeId = null;    // which node the tag picker is open for
 
 // ── Load ──────────────────────────────────────────────────────────────────────
 
 async function load() {
   setStatus('Loading…');
   try {
-    const all = await db.query('SELECT * FROM node ORDER BY parent_id NULLS FIRST, position');
+    const [all, tagsR, nodeTagsR] = await Promise.all([
+      db.query('SELECT * FROM node ORDER BY parent_id NULLS FIRST, position'),
+      db.send('get_tags'),
+      db.send('get_all_node_tags'),
+    ]);
     allNodes = all?.rows ?? [];
     nodeMap  = Object.fromEntries(allNodes.map(n => [n.id, n]));
+    allTags  = tagsR?.rows ?? [];
+    // Build nodeTagsMap
+    nodeTagsMap = {};
+    for (const nt of (nodeTagsR?.rows ?? [])) {
+      if (!nodeTagsMap[nt.node_id]) nodeTagsMap[nt.node_id] = [];
+      nodeTagsMap[nt.node_id].push({ id: nt.id, name: nt.name, color: nt.color });
+    }
     render(allNodes);
     setStatus(`${allNodes.length} nodes`);
   } catch(e) {
     setStatus('Error: ' + e.message);
     console.error(e);
   }
+}
+
+async function loadTags() {
+  const r = await db.send('get_tags');
+  allTags = r?.rows ?? [];
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -86,24 +105,49 @@ function escHtml(s) {
 
 function highlightText(text, q) {
   if (!q || !text) return escHtml(text ?? '');
-  const parts = [];
-  const lower = text.toLowerCase();
-  const len   = q.length;
-  let i = 0;
-  while (i < text.length) {
-    const found = lower.indexOf(q, i);
-    if (found === -1) { parts.push(escHtml(text.slice(i))); break; }
-    parts.push(escHtml(text.slice(i, found)));
-    parts.push(`<mark class="search-hl">${escHtml(text.slice(found, found + len))}</mark>`);
-    i = found + len;
+  // Extract plain-text terms (not field-prefixed) for highlighting
+  const terms = parseSearchTerms(q).filter(t => !t.field).map(t => t.value);
+  if (!terms.length) return escHtml(text);
+  let result = escHtml(text);
+  for (const term of terms) {
+    const re = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    result = result.replace(re, m => `<mark class="search-hl">${m}</mark>`);
   }
-  return parts.join('');
+  return result;
+}
+
+function parseSearchTerms(q) {
+  const terms = [];
+  const re = /(\w+):(\S+)|(\S+)/g;
+  let m;
+  while ((m = re.exec(q)) !== null) {
+    if (m[1]) terms.push({ field: m[1].toLowerCase(), value: m[2].toLowerCase() });
+    else      terms.push({ field: null,                value: m[3].toLowerCase() });
+  }
+  return terms;
 }
 
 function matchesSearch(n, q) {
-  return [n.title, n.url, n.favicon_url, n.note_text, n.custom_title,
-          n.custom_favicon, n.color_active, n.color_saved, n.relicons, n.win_rect]
-    .some(f => f && String(f).toLowerCase().includes(q));
+  const terms = parseSearchTerms(q);
+  return terms.every(t => matchesTerm(n, t));
+}
+
+function matchesTerm(n, t) {
+  const v = t.value;
+  const includes = (s) => s && String(s).toLowerCase().includes(v);
+  if (!t.field) {
+    return includes(n.title) || includes(n.url) || includes(n.note_text) || includes(n.custom_title);
+  }
+  if (t.field === 'title')  return includes(n.title);
+  if (t.field === 'url')    return includes(n.url);
+  if (t.field === 'domain') return includes(n.domain);
+  if (t.field === 'note')   return includes(n.note_text);
+  if (t.field === 'label')  return includes(n.custom_title || n.title || n.url || n.note_text);
+  if (t.field === 'tag') {
+    const tags = nodeTagsMap[n.id] ?? [];
+    return tags.some(tg => tg.name.toLowerCase().includes(v));
+  }
+  return includes(n.title) || includes(n.url) || includes(n.note_text) || includes(n.custom_title);
 }
 
 function setStatus(msg) {
@@ -147,6 +191,13 @@ function buildTree(parentId = null, depth = 0, searchOpts = null) {
     const noteText  = n.note_text || '';
     const noteHtml  = searchOpts ? highlightText(noteText, searchOpts.q) : escHtml(noteText);
 
+    const nodeTags = nodeTagsMap[n.id] ?? [];
+    const tagChipsHtml = nodeTags.length
+      ? `<span class="tag-chips">${nodeTags.map(t =>
+          `<span class="tag-chip" style="background:${escHtml(t.color)}">${escHtml(t.name)}</span>`
+        ).join('')}</span>`
+      : '';
+
     const editBtn = `<button class="act act-edit" data-id="${n.id}" title="Edit note">✎</button>`;
     const saveBtn = (n.node_type === 'tab')
       ? `<button class="act act-save" data-id="${n.id}" title="Save &amp; close">💾</button>`
@@ -170,6 +221,7 @@ function buildTree(parentId = null, depth = 0, searchOpts = null) {
               ${toggle}
               ${faviconHtml || `<span class="icon">${icon}</span>`}
               <span class="label ${label ? '' : 'muted'}">${labelHtml}</span>
+              ${tagChipsHtml}
               ${winType}${badge}
               ${actions}
             </div>
@@ -182,6 +234,8 @@ function buildTree(parentId = null, depth = 0, searchOpts = null) {
 
 function render(nodes, filter = '') {
   const treeEl = document.getElementById('tree');
+  const searchWinBtn  = document.getElementById('btn-search-window');
+  const tagSearchBtn  = document.getElementById('btn-tag-search');
   if (filter) {
     const q = filter.toLowerCase();
 
@@ -201,8 +255,12 @@ function render(nodes, filter = '') {
     const session = allNodes.find(n => n.node_type === 'session');
     treeEl.innerHTML = buildTree(session ? session.id : null, 0, { visibleIds, q });
     setStatus(`${matchedIds.size} result${matchedIds.size !== 1 ? 's' : ''}`);
+    searchWinBtn.style.display = matchedIds.size ? '' : 'none';
+    tagSearchBtn.style.display = matchedIds.size ? '' : 'none';
     return;
   }
+  searchWinBtn.style.display = 'none';
+  tagSearchBtn.style.display = 'none';
   const session = allNodes.find(n => n.node_type === 'session');
   treeEl.innerHTML = buildTree(session ? session.id : null, 0);
 }
@@ -340,10 +398,19 @@ document.getElementById('tree').addEventListener('contextmenu', e => {
   selected = +node.dataset.id;
   ctx.style.left = e.clientX + 'px';
   ctx.style.top  = e.clientY + 'px';
+  ctx._lastX = e.clientX;
+  ctx._lastY = e.clientY;
   ctx.classList.remove('hidden');
+  document.getElementById('tag-picker').classList.add('hidden');
 });
 
-document.addEventListener('click', () => ctx.classList.add('hidden'));
+document.addEventListener('click', e => {
+  ctx.classList.add('hidden');
+  if (!e.target.closest('#tag-picker')) {
+    document.getElementById('tag-picker').classList.add('hidden');
+    tagPickerNodeId = null;
+  }
+});
 
 ctx.addEventListener('click', async e => {
   const action = e.target.dataset.action;
@@ -358,6 +425,9 @@ ctx.addEventListener('click', async e => {
     await navigator.clipboard.writeText(n.url);
   } else if (action === 'copy-title') {
     await navigator.clipboard.writeText(nodeLabel(n));
+  } else if (action === 'tags') {
+    ctx.classList.add('hidden');
+    openTagPicker(selected, ctx._lastX, ctx._lastY);
   } else if (action === 'delete') {
     const descIds = allDescendantIds(selected);
     const kidCount = descIds.size - 1;
@@ -706,13 +776,6 @@ document.getElementById('btn-config').addEventListener('click', () => {
   document.getElementById('config-panel').classList.toggle('hidden');
 });
 
-document.querySelectorAll('.cfg-hdr').forEach(hdr => {
-  hdr.addEventListener('click', () => {
-    const body = document.getElementById(hdr.dataset.target);
-    hdr.classList.toggle('collapsed', body.classList.toggle('hidden'));
-  });
-});
-
 document.getElementById('cfg-colors-reset').addEventListener('click', async () => {
   await chrome.storage.local.remove(THEME_KEY);
   COLOR_VARS.forEach(cv => document.documentElement.style.setProperty(cv.prop, cv.def));
@@ -948,6 +1011,411 @@ async function exportSQL() {
 
   downloadFile('tabsql-export.sql', [SQL_DDL_COMMENT, '', ...inserts].join('\n'), 'text/plain');
 }
+
+// ── Tag picker ────────────────────────────────────────────────────────────────
+
+const tagPickerEl     = document.getElementById('tag-picker');
+const tagPickerListEl = document.getElementById('tag-picker-list');
+
+async function openTagPicker(nodeId, x, y) {
+  tagPickerNodeId = nodeId;
+  const n = nodeMap[nodeId];
+  const isWin = n?.node_type === 'win' || n?.node_type === 'savedwin';
+
+  // Load current tags for this node
+  const r = await db.send('get_node_tags', { nodeId });
+  const currentTagIds = new Set((r?.rows ?? []).map(t => t.id));
+
+  // Load win auto-tags if applicable
+  let autoTagIds = new Set();
+  if (isWin) {
+    const ar = await db.send('get_win_auto_tags', { winNodeId: nodeId });
+    autoTagIds = new Set((ar?.rows ?? []).map(t => t.id));
+  }
+
+  renderTagPickerList(nodeId, currentTagIds, autoTagIds, isWin);
+
+  // Position
+  tagPickerEl.style.left = Math.min(x, window.innerWidth - 220) + 'px';
+  tagPickerEl.style.top  = Math.min(y, window.innerHeight - 300) + 'px';
+  tagPickerEl.classList.remove('hidden');
+}
+
+function renderTagPickerList(nodeId, currentTagIds, autoTagIds, isWin) {
+  tagPickerListEl.innerHTML = allTags.map(t => `
+    <div class="tag-pick-row" data-tag-id="${t.id}">
+      <span class="tag-pick-dot" style="background:${escHtml(t.color)}"></span>
+      <span class="tag-pick-name">${escHtml(t.name)}</span>
+      <span class="tag-pick-check">${currentTagIds.has(t.id) ? '✓' : ''}</span>
+    </div>
+  `).join('') || '<div style="padding:4px 6px;font-size:11px;color:var(--muted)">No tags yet</div>';
+
+  const autoSection = document.getElementById('tag-picker-win-auto');
+  if (isWin) {
+    autoSection.classList.remove('hidden');
+  } else {
+    autoSection.classList.add('hidden');
+  }
+
+  // Click to toggle tag
+  tagPickerListEl.querySelectorAll('.tag-pick-row').forEach(row => {
+    row.addEventListener('click', async e => {
+      e.stopPropagation();
+      const tagId = +row.dataset.tagId;
+      const wasOn = currentTagIds.has(tagId);
+      if (wasOn) currentTagIds.delete(tagId); else currentTagIds.add(tagId);
+      await db.send('set_node_tags', { nodeId: tagPickerNodeId, tagIds: [...currentTagIds] });
+      // Update nodeTagsMap locally
+      nodeTagsMap[tagPickerNodeId] = allTags.filter(t => currentTagIds.has(t.id));
+      // Re-render the chip on the node row
+      const nodeEl = treeEl.querySelector(`[data-id="${tagPickerNodeId}"]`);
+      if (nodeEl) {
+        let chips = nodeEl.querySelector('.tag-chips');
+        const tags = nodeTagsMap[tagPickerNodeId] ?? [];
+        if (!chips) {
+          chips = document.createElement('span');
+          chips.className = 'tag-chips';
+          nodeEl.querySelector('.label').after(chips);
+        }
+        chips.innerHTML = tags.map(t =>
+          `<span class="tag-chip" style="background:${escHtml(t.color)}">${escHtml(t.name)}</span>`
+        ).join('');
+      }
+      renderTagPickerList(tagPickerNodeId, currentTagIds, autoTagIds, isWin);
+    });
+  });
+
+  if (isWin) {
+    const cb = document.getElementById('tag-picker-auto-cb');
+    // Checkbox state reflects whether ANY checked tag has auto-tagging on
+    // We'll use it as a per-open-operation toggle bound to the last clicked tag
+    // Simpler: show auto state for all current tags as a single checkbox
+    cb.checked = [...currentTagIds].some(tid => autoTagIds.has(tid));
+    cb.onchange = async () => {
+      for (const tid of currentTagIds) {
+        await db.send('set_win_auto_tag', { winNodeId: tagPickerNodeId, tagId: tid, enabled: cb.checked });
+        if (cb.checked) autoTagIds.add(tid); else autoTagIds.delete(tid);
+      }
+    };
+  }
+}
+
+// Add new tag from picker
+document.getElementById('tag-picker-new-add').addEventListener('click', async e => {
+  e.stopPropagation();
+  const name  = document.getElementById('tag-picker-new-name').value.trim();
+  const color = document.getElementById('tag-picker-new-color').value;
+  if (!name) return;
+  const r = await db.send('save_tag', { name, color });
+  await loadTags();
+  document.getElementById('tag-picker-new-name').value = '';
+  if (tagPickerNodeId != null) {
+    const cr = await db.send('get_node_tags', { nodeId: tagPickerNodeId });
+    const currentTagIds = new Set((cr?.rows ?? []).map(t => t.id));
+    const n = nodeMap[tagPickerNodeId];
+    const isWin = n?.node_type === 'win' || n?.node_type === 'savedwin';
+    renderTagPickerList(tagPickerNodeId, currentTagIds, new Set(), isWin);
+  }
+});
+
+document.getElementById('tag-picker-new-name').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('tag-picker-new-add').click();
+  e.stopPropagation();
+});
+
+// ── Search toolbar buttons ────────────────────────────────────────────────────
+
+document.getElementById('btn-search-window').addEventListener('click', async () => {
+  const q = document.getElementById('search').value.trim();
+  if (!q) return;
+  const r = await db.send('open_search_in_window', { q });
+  setStatus(`Opened ${r?.opened ?? 0} tabs in new window`);
+});
+
+document.getElementById('btn-tag-search').addEventListener('click', async e => {
+  e.stopPropagation();
+  if (!allTags.length) {
+    setStatus('No tags defined yet — create one in Settings > Tags');
+    return;
+  }
+  const q = document.getElementById('search').value.trim();
+  // Show a small floating picker to choose which tag to apply
+  const btn = document.getElementById('btn-tag-search');
+  const rect = btn.getBoundingClientRect();
+  tagPickerNodeId = null; // signal: applying to search results
+
+  const picker = document.getElementById('tag-picker');
+  const autoSection = document.getElementById('tag-picker-win-auto');
+  autoSection.classList.add('hidden');
+
+  tagPickerListEl.innerHTML = allTags.map(t => `
+    <div class="tag-pick-row" data-tag-id="${t.id}">
+      <span class="tag-pick-dot" style="background:${escHtml(t.color)}"></span>
+      <span class="tag-pick-name">${escHtml(t.name)}</span>
+      <span class="tag-pick-check"></span>
+    </div>
+  `).join('');
+
+  tagPickerListEl.querySelectorAll('.tag-pick-row').forEach(row => {
+    row.addEventListener('click', async ev => {
+      ev.stopPropagation();
+      picker.classList.add('hidden');
+      const tagId = +row.dataset.tagId;
+      const r2 = await db.send('tag_search_results', { q, tagId });
+      await load();
+      setStatus(`Tagged ${r2?.count ?? 0} nodes`);
+    });
+  });
+
+  picker.style.left = rect.left + 'px';
+  picker.style.top  = (rect.bottom + 4) + 'px';
+  picker.classList.remove('hidden');
+});
+
+// ── Config: Tags ──────────────────────────────────────────────────────────────
+
+async function loadCfgTags() {
+  const r    = await db.send('get_tags');
+  allTags    = r?.rows ?? [];
+  const list = document.getElementById('cfg-tag-list');
+  list.innerHTML = allTags.map(t => `
+    <div class="tag-list-row">
+      <span class="tag-list-dot" style="background:${escHtml(t.color)}"></span>
+      <span class="tag-list-name">${escHtml(t.name)}</span>
+      <button class="tag-list-del" data-id="${t.id}" title="Delete tag">✕</button>
+    </div>
+  `).join('') || '<div style="font-size:11px;color:var(--muted)">No tags yet</div>';
+
+  list.querySelectorAll('.tag-list-del').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      await db.send('delete_tag', { id: +btn.dataset.id });
+      await loadCfgTags();
+      await load();
+    });
+  });
+}
+
+document.getElementById('cfg-tag-add').addEventListener('click', async () => {
+  const name  = document.getElementById('cfg-tag-name').value.trim();
+  const color = document.getElementById('cfg-tag-color').value;
+  if (!name) return;
+  await db.send('save_tag', { name, color });
+  document.getElementById('cfg-tag-name').value = '';
+  await loadCfgTags();
+});
+
+document.getElementById('cfg-tag-name').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('cfg-tag-add').click();
+});
+
+// ── Config: Actions ───────────────────────────────────────────────────────────
+
+async function loadCfgActions() {
+  const [ar, tr] = await Promise.all([db.send('get_action_rules'), db.send('get_tags')]);
+  allTags = tr?.rows ?? [];
+  const rules = ar?.rows ?? [];
+  const list  = document.getElementById('cfg-action-list');
+
+  if (!rules.length) {
+    list.innerHTML = '<div style="font-size:11px;color:var(--muted)">No actions yet</div>';
+    return;
+  }
+
+  list.innerHTML = rules.map(r => {
+    const cfg = r.config ? JSON.parse(r.config) : {};
+    const tagName = cfg.tag_id ? (allTags.find(t => t.id === cfg.tag_id)?.name ?? '?') : '';
+    const badgeText = r.action_type === 'add_tag' ? `tag:${tagName}`
+                    : r.action_type === 'delete'  ? `delete${cfg.delay_days ? ` (${cfg.delay_days}d)` : ''}`
+                    : r.action_type === 'move'     ? 'move'
+                    : r.action_type;
+    return `
+      <div class="action-row" data-rule-id="${r.id}">
+        <div class="action-row-hdr">
+          <span class="action-name">${escHtml(r.name)}</span>
+          <span class="action-badges">
+            <span class="action-badge">${escHtml(badgeText)}</span>
+            ${r.is_auto ? '<span class="action-badge auto">auto</span>' : ''}
+          </span>
+          <span class="action-row-btns">
+            <button class="ar-run" data-id="${r.id}" title="Run now">▶</button>
+            <button class="ar-edit" data-id="${r.id}" title="Edit">✎</button>
+            <button class="ar-del" data-id="${r.id}" title="Delete">✕</button>
+          </span>
+        </div>
+      </div>`;
+  }).join('');
+
+  list.querySelectorAll('.ar-run').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const status = document.getElementById('cfg-actions-status');
+      status.textContent = 'Running…';
+      const r2 = await db.send('run_action_rule', { id: +btn.dataset.id });
+      status.textContent = `${r2?.affected ?? 0} affected`;
+      await load();
+    });
+  });
+
+  list.querySelectorAll('.ar-del').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      await db.send('delete_action_rule', { id: +btn.dataset.id });
+      await loadCfgActions();
+    });
+  });
+
+  list.querySelectorAll('.ar-edit').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const ruleId = +btn.dataset.id;
+      const rule = rules.find(r => r.id === ruleId);
+      if (!rule) return;
+      showActionEditor(rule);
+    });
+  });
+}
+
+function showActionEditor(existing) {
+  const list   = document.getElementById('cfg-action-list');
+  const cfg    = existing?.config ? JSON.parse(existing.config) : {};
+  const tagOpts = allTags.map(t => `<option value="${t.id}" ${cfg.tag_id === t.id ? 'selected' : ''}>${escHtml(t.name)}</option>`).join('');
+
+  const editorHtml = `
+    <div class="action-editor" id="action-editor-form">
+      <div class="action-editor-row">
+        <label>Name</label>
+        <input type="text" id="ae-name" value="${escHtml(existing?.name ?? '')}" placeholder="Action name">
+      </div>
+      <div class="action-editor-row">
+        <label>Type</label>
+        <select id="ae-type">
+          <option value="add_tag" ${existing?.action_type === 'add_tag' ? 'selected' : ''}>Add tag</option>
+          <option value="delete"  ${existing?.action_type === 'delete'  ? 'selected' : ''}>Delete</option>
+          <option value="move"    ${existing?.action_type === 'move'    ? 'selected' : ''}>Move to window</option>
+        </select>
+      </div>
+      <div class="action-editor-row" id="ae-tag-row">
+        <label>Tag</label>
+        <select id="ae-tag">${tagOpts}</select>
+      </div>
+      <div class="action-editor-row" id="ae-delay-row">
+        <label>Delay (days, 0=immediate)</label>
+        <input type="number" id="ae-delay" value="${cfg.delay_days ?? 0}" min="0">
+      </div>
+      <div class="action-editor-row" id="ae-win-row">
+        <label>Target window node ID</label>
+        <input type="number" id="ae-win" value="${cfg.target_win_id ?? ''}">
+      </div>
+      <div class="action-editor-row">
+        <label>Condition type</label>
+        <select id="ae-cond-type">
+          <option value="search" ${existing?.condition_type !== 'sql' ? 'selected' : ''}>Search string</option>
+          <option value="sql"    ${existing?.condition_type === 'sql'  ? 'selected' : ''}>SQL query</option>
+        </select>
+      </div>
+      <div>
+        <label>Condition</label>
+        <textarea id="ae-condition" placeholder="Search terms or SQL SELECT…">${escHtml(existing?.condition ?? '')}</textarea>
+      </div>
+      <div class="action-editor-row">
+        <label><input type="checkbox" id="ae-auto" ${existing?.is_auto ? 'checked' : ''}> Run automatically</label>
+      </div>
+      <div class="action-editor-row">
+        <button class="btn" id="ae-save">Save</button>
+        <button class="btn" id="ae-cancel">Cancel</button>
+      </div>
+    </div>`;
+
+  const container = document.createElement('div');
+  container.innerHTML = editorHtml;
+  list.prepend(container);
+
+  function updateVisibility() {
+    const type = document.getElementById('ae-type').value;
+    document.getElementById('ae-tag-row').style.display   = type === 'add_tag' ? '' : 'none';
+    document.getElementById('ae-delay-row').style.display = type === 'delete'  ? '' : 'none';
+    document.getElementById('ae-win-row').style.display   = type === 'move'    ? '' : 'none';
+  }
+  updateVisibility();
+  document.getElementById('ae-type').addEventListener('change', updateVisibility);
+
+  document.getElementById('ae-cancel').addEventListener('click', () => {
+    container.remove();
+  });
+
+  document.getElementById('ae-save').addEventListener('click', async () => {
+    const name      = document.getElementById('ae-name').value.trim();
+    const type      = document.getElementById('ae-type').value;
+    const condType  = document.getElementById('ae-cond-type').value;
+    const condition = document.getElementById('ae-condition').value.trim();
+    const isAuto    = document.getElementById('ae-auto').checked;
+    if (!name || !condition) return;
+    const cfgObj = {};
+    if (type === 'add_tag') cfgObj.tag_id = +document.getElementById('ae-tag').value;
+    if (type === 'delete')  cfgObj.delay_days = +document.getElementById('ae-delay').value;
+    if (type === 'move')    cfgObj.target_win_id = +document.getElementById('ae-win').value;
+    await db.send('save_action_rule', {
+      id: existing?.id,
+      name, action_type: type, condition_type: condType, condition,
+      config: JSON.stringify(cfgObj), is_auto: isAuto,
+    });
+    container.remove();
+    await loadCfgActions();
+  });
+}
+
+document.getElementById('cfg-action-new').addEventListener('click', () => showActionEditor(null));
+
+document.getElementById('cfg-action-run-all').addEventListener('click', async () => {
+  const status = document.getElementById('cfg-actions-status');
+  status.textContent = 'Running…';
+  const r = await db.send('run_auto_actions');
+  status.textContent = `${r?.total ?? 0} affected`;
+  await load();
+});
+
+// Reload tags/actions sections when their config header is expanded
+document.querySelectorAll('.cfg-hdr').forEach(hdr => {
+  hdr.addEventListener('click', () => {
+    const body = document.getElementById(hdr.dataset.target);
+    const wasHidden = body.classList.contains('hidden');
+    hdr.classList.toggle('collapsed', body.classList.toggle('hidden'));
+    if (wasHidden) {
+      if (hdr.dataset.target === 'cfg-tags-body')    loadCfgTags();
+      if (hdr.dataset.target === 'cfg-actions-body') loadCfgActions();
+    }
+  });
+});
+
+// ── Schema popup ──────────────────────────────────────────────────────────────
+
+document.getElementById('sql-schema').addEventListener('click', async () => {
+  const popup = document.getElementById('schema-popup');
+  popup.classList.remove('hidden');
+  const body = document.getElementById('schema-popup-body');
+  body.innerHTML = '<div style="padding:16px;color:var(--muted)">Loading…</div>';
+  try {
+    const r = await db.send('get_schema');
+    const schema = r?.schema ?? {};
+    body.innerHTML = Object.entries(schema).map(([tname, cols]) => `
+      <div class="schema-table">
+        <div class="schema-table-name">${escHtml(tname)}</div>
+        <table class="schema-cols">
+          <thead><tr><th>col</th><th>type</th><th>notnull</th><th>default</th></tr></thead>
+          <tbody>${(cols ?? []).map(c => `<tr>
+            <td>${c.pk ? `<span class="schema-pk">PK </span>` : ''}${escHtml(c.name)}</td>
+            <td>${escHtml(c.type)}</td>
+            <td>${c.notnull ? '✓' : ''}</td>
+            <td>${c.dflt_value != null ? escHtml(String(c.dflt_value)) : ''}</td>
+          </tr>`).join('')}</tbody>
+        </table>
+      </div>
+    `).join('');
+  } catch(e) {
+    body.innerHTML = `<div style="padding:16px;color:var(--red)">${escHtml(e.message)}</div>`;
+  }
+});
+
+document.getElementById('schema-popup-close').addEventListener('click', () => {
+  document.getElementById('schema-popup').classList.add('hidden');
+});
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 

@@ -29,6 +29,7 @@ is_open       INTEGER (0/1)
 chrome_id     INTEGER  -- Chrome window/tab ID; NULL for saved nodes
 title         TEXT
 url           TEXT
+domain        TEXT  -- hostname extracted from url, auto-populated by upsertNode
 favicon_url   TEXT
 note_text     TEXT
 custom_title  TEXT
@@ -41,6 +42,8 @@ created_at    TEXT  -- datetime('now')
 updated_at    TEXT  -- datetime('now')
 ```
 
+`domain` is auto-populated by `extractDomain(url)` in `upsertNode` whenever `url` is set. Migrated for existing rows in `applySchema()`.
+
 ### Views
 - `tab_flat` — tabs/savedtabs joined with their parent info
 - `window_summary` — windows with tab counts
@@ -52,6 +55,42 @@ label       TEXT
 sql         TEXT
 position    INTEGER
 is_default  INTEGER (0/1)
+```
+
+### `tag` table
+```
+id    INTEGER PK AUTOINCREMENT
+name  TEXT UNIQUE
+color TEXT  -- CSS color string, e.g. '#7c9ef8'
+```
+
+### `node_tag` table (many-to-many)
+```
+node_id  INTEGER NOT NULL
+tag_id   INTEGER NOT NULL
+PRIMARY KEY (node_id, tag_id)
+```
+
+### `win_auto_tag` table
+When a tag is registered here for a window node, `onTabCreated` automatically inserts into `node_tag` for every new tab opened in that window.
+```
+win_node_id  INTEGER NOT NULL
+tag_id       INTEGER NOT NULL
+PRIMARY KEY (win_node_id, tag_id)
+```
+Removing a win_auto_tag entry stops future auto-tagging but does NOT remove the tag from existing node_tag rows.
+
+### `action_rule` table
+```
+id             INTEGER PK AUTOINCREMENT
+name           TEXT
+action_type    TEXT  -- 'add_tag' | 'delete' | 'move'
+condition_type TEXT  -- 'search' | 'sql'
+condition      TEXT  -- search string or SQL SELECT
+config         TEXT  -- JSON: {tag_id?, delay_days?, target_win_id?}
+is_auto        INTEGER (0/1)
+position       INTEGER
+created_at     TEXT
 ```
 
 ## Node types
@@ -111,15 +150,36 @@ All messages: `{ to: 'background', cmd, payload }` → response `{ ok, data }` o
 |---|---|---|
 | `bulk_exec` | `{ sql }` | `{ rows }` |
 | `upsert_node` | `{ node }` | `{ id }` |
-| `delete_node` | `{ id }` | cascade-deletes all descendants |
+| `delete_node` | `{ id }` | cascade-deletes all descendants + node_tag/win_auto_tag cleanup |
 | `move_node` | `{ id, parent_id, position }` | — |
 | `get_node` | `{ id }` | `{ row }` |
+| `search` | `{ q }` | `{ rows }` — supports field-prefix syntax |
 | `pre_open_tab` | `{ nodeId, url }` | sets pendingAdopt |
 | `open_saved_window` | `{ winNodeId }` | opens all savedtab children in new window |
+| `open_search_in_window` | `{ q }` | opens matching tab/savedtab URLs in new window |
 | `get_quick_queries` | — | `{ rows }` |
 | `save_quick_query` | `{ id?, label, sql }` | upsert by id |
 | `delete_quick_query` | `{ id }` | — |
 | `seed_default_queries` | — | `{ added }` |
+| `get_tags` | — | `{ rows }` |
+| `save_tag` | `{ id?, name, color }` | `{ id }` |
+| `delete_tag` | `{ id }` | removes from node_tag and win_auto_tag too |
+| `get_node_tags` | `{ nodeId }` | `{ rows }` — tag rows for one node |
+| `get_all_node_tags` | — | `{ rows }` — all node_tag rows joined with tag |
+| `set_node_tags` | `{ nodeId, tagIds[] }` | replaces all tags for node |
+| `get_win_auto_tags` | `{ winNodeId }` | `{ rows }` |
+| `set_win_auto_tag` | `{ winNodeId, tagId, enabled }` | insert or delete win_auto_tag row |
+| `tag_search_results` | `{ q, tagId }` | tags all matching nodes; adds win_auto_tag for window nodes |
+| `get_action_rules` | — | `{ rows }` |
+| `save_action_rule` | `{ id?, name, action_type, condition_type, condition, config, is_auto }` | `{ id }` |
+| `delete_action_rule` | `{ id }` | — |
+| `run_action_rule` | `{ id }` | `{ affected }` |
+| `run_auto_actions` | — | `{ total }` — runs all is_auto=1 rules |
+| `get_schema` | — | `{ schema }` — object keyed by table/view name, values are PRAGMA table_info rows |
+
+## Search term parser
+
+`parseSearchTerms(q)` in both `background.js` and `tree.js` splits a query into `[{field, value}]`. Field is null for bare terms. `buildSearchWhere(terms)` (background only) returns `{ where, params }` for a parameterized SQL WHERE clause. Supported field prefixes: `title`, `url`, `domain`, `note`, `label`, `tag`.
 
 ## tree.js key patterns
 

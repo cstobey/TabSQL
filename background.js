@@ -99,7 +99,41 @@ function applySchema() {
       is_default INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_qquery_pos ON quick_query (position);
+    CREATE TABLE IF NOT EXISTS tag (
+      id    INTEGER PRIMARY KEY AUTOINCREMENT,
+      name  TEXT NOT NULL UNIQUE,
+      color TEXT NOT NULL DEFAULT '#7c9ef8'
+    );
+    CREATE TABLE IF NOT EXISTS node_tag (
+      node_id INTEGER NOT NULL,
+      tag_id  INTEGER NOT NULL,
+      PRIMARY KEY (node_id, tag_id)
+    );
+    CREATE TABLE IF NOT EXISTS win_auto_tag (
+      win_node_id INTEGER NOT NULL,
+      tag_id      INTEGER NOT NULL,
+      PRIMARY KEY (win_node_id, tag_id)
+    );
+    CREATE TABLE IF NOT EXISTS action_rule (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      name           TEXT NOT NULL,
+      action_type    TEXT NOT NULL,
+      condition_type TEXT NOT NULL,
+      condition      TEXT NOT NULL,
+      config         TEXT,
+      is_auto        INTEGER NOT NULL DEFAULT 0,
+      position       INTEGER NOT NULL DEFAULT 0,
+      created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
+  // Migrate: add domain column to existing DBs
+  try { db.exec('ALTER TABLE node ADD COLUMN domain TEXT'); } catch {}
+  // Populate domain for nodes that have a url but no domain yet
+  const needsDomain = sqlQuery('SELECT id, url FROM node WHERE url IS NOT NULL AND (domain IS NULL OR domain = "")');
+  for (const n of needsDomain) {
+    const d = extractDomain(n.url);
+    if (d) sqlRun('UPDATE node SET domain=? WHERE id=?', [d, n.id]);
+  }
   // Seed defaults on first creation (empty table)
   const count = sqlQuery('SELECT COUNT(*) c FROM quick_query')[0]?.c ?? 0;
   if (+count === 0) seedDefaultQueries();
@@ -138,11 +172,59 @@ function sqlInsert(sql, params = []) {
   return db.exec('SELECT last_insert_rowid()')[0].values[0][0];
 }
 
+function extractDomain(url) {
+  if (!url) return null;
+  try { return new URL(url).hostname || null; } catch { return null; }
+}
+
+// Parse "field:value plain terms" into [{field, value}]
+function parseSearchTerms(q) {
+  const terms = [];
+  const re = /(\w+):(\S+)|(\S+)/g;
+  let m;
+  while ((m = re.exec(q)) !== null) {
+    if (m[1]) terms.push({ field: m[1].toLowerCase(), value: m[2].toLowerCase() });
+    else      terms.push({ field: null,                value: m[3].toLowerCase() });
+  }
+  return terms;
+}
+
+function buildSearchWhere(terms) {
+  const clauses = [], params = [];
+  for (const t of terms) {
+    const like = `%${t.value}%`;
+    if (!t.field) {
+      clauses.push('(title LIKE ? OR url LIKE ? OR note_text LIKE ? OR custom_title LIKE ?)');
+      params.push(like, like, like, like);
+    } else if (t.field === 'title') {
+      clauses.push('title LIKE ?'); params.push(like);
+    } else if (t.field === 'url') {
+      clauses.push('url LIKE ?'); params.push(like);
+    } else if (t.field === 'domain') {
+      clauses.push('domain LIKE ?'); params.push(like);
+    } else if (t.field === 'note') {
+      clauses.push('note_text LIKE ?'); params.push(like);
+    } else if (t.field === 'label') {
+      clauses.push('(COALESCE(custom_title, title, url, note_text) LIKE ?)'); params.push(like);
+    } else if (t.field === 'tag') {
+      clauses.push('id IN (SELECT nt.node_id FROM node_tag nt JOIN tag t2 ON t2.id=nt.tag_id WHERE t2.name LIKE ?)');
+      params.push(like);
+    } else {
+      clauses.push('(title LIKE ? OR url LIKE ? OR note_text LIKE ? OR custom_title LIKE ?)');
+      params.push(like, like, like, like);
+    }
+  }
+  return { where: clauses.length ? clauses.join(' AND ') : '1=1', params };
+}
+
 // ---------------------------------------------------------------------------
 // Node operations
 // ---------------------------------------------------------------------------
 
 function upsertNode(node) {
+  if ('url' in node && !('domain' in node)) {
+    node = { ...node, domain: extractDomain(node.url) };
+  }
   const cols = Object.keys(node).filter(k => k !== 'id');
   if ('id' in node) {
     const set = cols.map(c => `${c} = ?`).join(', ');
@@ -193,7 +275,11 @@ async function handleMessage(cmd, payload) {
         const kids = sqlQuery('SELECT id FROM node WHERE parent_id=?', [pid]);
         kids.forEach(k => { toDelete.push(k.id); queue.push(k.id); });
       }
-      toDelete.forEach(id => sqlRun('DELETE FROM node WHERE id=?', [id]));
+      toDelete.forEach(id => {
+        sqlRun('DELETE FROM node_tag WHERE node_id=?', [id]);
+        sqlRun('DELETE FROM win_auto_tag WHERE win_node_id=?', [id]);
+        sqlRun('DELETE FROM node WHERE id=?', [id]);
+      });
       await persistDb();
       return { ok: true };
     }
@@ -214,11 +300,9 @@ async function handleMessage(cmd, payload) {
     }
 
     case 'search': {
-      const like = `%${payload.q}%`;
-      const rows = sqlQuery(
-        'SELECT * FROM node WHERE title LIKE ? OR url LIKE ? OR note_text LIKE ? LIMIT 200',
-        [like, like, like]
-      );
+      const terms = parseSearchTerms(payload.q.toLowerCase());
+      const { where, params } = buildSearchWhere(terms);
+      const rows = sqlQuery(`SELECT * FROM node WHERE ${where} LIMIT 200`, params);
       return { ok: true, rows };
     }
 
@@ -305,9 +389,212 @@ async function handleMessage(cmd, payload) {
       return { ok: true, added };
     }
 
+    // ── Tags ──────────────────────────────────────────────────────────────────
+    case 'get_tags':
+      return { ok: true, rows: sqlQuery('SELECT * FROM tag ORDER BY name') };
+
+    case 'save_tag': {
+      const { id: tid, name: tname, color: tcolor } = payload;
+      if (tid) {
+        sqlRun('UPDATE tag SET name=?, color=? WHERE id=?', [tname, tcolor, tid]);
+        await persistDb();
+        return { ok: true, id: tid };
+      }
+      const newId = sqlInsert('INSERT INTO tag (name, color) VALUES (?,?)', [tname, tcolor]);
+      await persistDb();
+      return { ok: true, id: newId };
+    }
+
+    case 'delete_tag': {
+      sqlRun('DELETE FROM node_tag WHERE tag_id=?', [payload.id]);
+      sqlRun('DELETE FROM win_auto_tag WHERE tag_id=?', [payload.id]);
+      sqlRun('DELETE FROM tag WHERE id=?', [payload.id]);
+      await persistDb();
+      return { ok: true };
+    }
+
+    case 'get_node_tags': {
+      const rows = sqlQuery(
+        'SELECT t.* FROM tag t JOIN node_tag nt ON t.id=nt.tag_id WHERE nt.node_id=?',
+        [payload.nodeId]
+      );
+      return { ok: true, rows };
+    }
+
+    case 'get_all_node_tags': {
+      const rows = sqlQuery('SELECT nt.node_id, t.id, t.name, t.color FROM node_tag nt JOIN tag t ON t.id=nt.tag_id');
+      return { ok: true, rows };
+    }
+
+    case 'set_node_tags': {
+      sqlRun('DELETE FROM node_tag WHERE node_id=?', [payload.nodeId]);
+      for (const tid of (payload.tagIds ?? [])) {
+        sqlRun('INSERT OR IGNORE INTO node_tag (node_id, tag_id) VALUES (?,?)', [payload.nodeId, tid]);
+      }
+      await persistDb();
+      return { ok: true };
+    }
+
+    case 'get_win_auto_tags': {
+      const rows = sqlQuery(
+        'SELECT t.* FROM tag t JOIN win_auto_tag wat ON t.id=wat.tag_id WHERE wat.win_node_id=?',
+        [payload.winNodeId]
+      );
+      return { ok: true, rows };
+    }
+
+    case 'set_win_auto_tag': {
+      // payload: { winNodeId, tagId, enabled }
+      if (payload.enabled) {
+        sqlRun('INSERT OR IGNORE INTO win_auto_tag (win_node_id, tag_id) VALUES (?,?)', [payload.winNodeId, payload.tagId]);
+      } else {
+        sqlRun('DELETE FROM win_auto_tag WHERE win_node_id=? AND tag_id=?', [payload.winNodeId, payload.tagId]);
+      }
+      await persistDb();
+      return { ok: true };
+    }
+
+    case 'tag_search_results': {
+      // Apply tag to all nodes matching the current search, plus win_auto_tag for window nodes
+      const terms = parseSearchTerms((payload.q ?? '').toLowerCase());
+      const { where, params } = buildSearchWhere(terms);
+      const matched = sqlQuery(`SELECT id, node_type FROM node WHERE ${where} LIMIT 1000`, params);
+      for (const n of matched) {
+        sqlRun('INSERT OR IGNORE INTO node_tag (node_id, tag_id) VALUES (?,?)', [n.id, payload.tagId]);
+        if (n.node_type === 'win' || n.node_type === 'savedwin') {
+          sqlRun('INSERT OR IGNORE INTO win_auto_tag (win_node_id, tag_id) VALUES (?,?)', [n.id, payload.tagId]);
+          // Also tag all children
+          const kids = sqlQuery('SELECT id FROM node WHERE parent_id=?', [n.id]);
+          for (const k of kids) {
+            sqlRun('INSERT OR IGNORE INTO node_tag (node_id, tag_id) VALUES (?,?)', [k.id, payload.tagId]);
+          }
+        }
+      }
+      await persistDb();
+      return { ok: true, count: matched.length };
+    }
+
+    // ── Action rules ─────────────────────────────────────────────────────────
+    case 'get_action_rules':
+      return { ok: true, rows: sqlQuery('SELECT * FROM action_rule ORDER BY position, id') };
+
+    case 'save_action_rule': {
+      const { id: aid, name: aname, action_type, condition_type, condition, config, is_auto, position: apos } = payload;
+      if (aid) {
+        sqlRun(
+          'UPDATE action_rule SET name=?, action_type=?, condition_type=?, condition=?, config=?, is_auto=? WHERE id=?',
+          [aname, action_type, condition_type, condition, config ?? null, is_auto ? 1 : 0, aid]
+        );
+        await persistDb();
+        return { ok: true, id: aid };
+      }
+      const maxPos = sqlQuery('SELECT MAX(position) m FROM action_rule')[0]?.m ?? -1;
+      const newId = sqlInsert(
+        'INSERT INTO action_rule (name, action_type, condition_type, condition, config, is_auto, position) VALUES (?,?,?,?,?,?,?)',
+        [aname, action_type, condition_type, condition, config ?? null, is_auto ? 1 : 0, (apos ?? maxPos + 1)]
+      );
+      await persistDb();
+      return { ok: true, id: newId };
+    }
+
+    case 'delete_action_rule':
+      sqlRun('DELETE FROM action_rule WHERE id=?', [payload.id]);
+      await persistDb();
+      return { ok: true };
+
+    case 'run_action_rule': {
+      const rule = sqlQuery('SELECT * FROM action_rule WHERE id=?', [payload.id])[0];
+      if (!rule) return { ok: false, error: 'Rule not found' };
+      const affected = await executeActionRule(rule);
+      return { ok: true, affected };
+    }
+
+    case 'run_auto_actions': {
+      const rules = sqlQuery('SELECT * FROM action_rule WHERE is_auto=1');
+      let total = 0;
+      for (const rule of rules) total += await executeActionRule(rule);
+      if (total > 0) await persistDb();
+      return { ok: true, total };
+    }
+
+    case 'open_search_in_window': {
+      // Open all tab/savedtab results matching q in a new Chrome window
+      const terms = parseSearchTerms((payload.q ?? '').toLowerCase());
+      const { where, params } = buildSearchWhere(terms);
+      const tabs = sqlQuery(
+        `SELECT id, url, is_open, chrome_id FROM node WHERE (${where}) AND node_type IN ('tab','savedtab') AND url IS NOT NULL LIMIT 50`,
+        params
+      );
+      if (!tabs.length) return { ok: true, opened: 0 };
+      const urls = tabs.map(t => t.url);
+      await chrome.windows.create({ url: urls });
+      return { ok: true, opened: urls.length };
+    }
+
+    // ── Schema info ──────────────────────────────────────────────────────────
+    case 'get_schema': {
+      const tables = sqlQuery("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
+      const views  = sqlQuery("SELECT name FROM sqlite_master WHERE type='view'  ORDER BY name");
+      const result = {};
+      for (const t of [...tables, ...views]) {
+        try {
+          result[t.name] = sqlQuery(`PRAGMA table_info(${t.name})`);
+        } catch {}
+      }
+      return { ok: true, schema: result };
+    }
+
     default:
       throw new Error(`Unknown command: ${cmd}`);
   }
+}
+
+async function executeActionRule(rule) {
+  let nodes = [];
+  if (rule.condition_type === 'search') {
+    const terms = parseSearchTerms((rule.condition ?? '').toLowerCase());
+    const { where, params } = buildSearchWhere(terms);
+    nodes = sqlQuery(`SELECT * FROM node WHERE ${where} LIMIT 1000`, params);
+  } else {
+    try { nodes = sqlQuery(rule.condition); } catch { return 0; }
+  }
+
+  const cfg = rule.config ? JSON.parse(rule.config) : {};
+  let count = 0;
+
+  if (rule.action_type === 'add_tag' && cfg.tag_id) {
+    for (const n of nodes) {
+      sqlRun('INSERT OR IGNORE INTO node_tag (node_id, tag_id) VALUES (?,?)', [n.id, cfg.tag_id]);
+      count++;
+    }
+  } else if (rule.action_type === 'delete') {
+    const delayDays = +(cfg.delay_days ?? 0);
+    for (const n of nodes) {
+      if (delayDays > 0) {
+        const rows = sqlQuery(
+          `SELECT id FROM node WHERE id=? AND updated_at <= datetime('now', '-${delayDays} days')`,
+          [n.id]
+        );
+        if (!rows.length) continue;
+      }
+      sqlRun('DELETE FROM node_tag WHERE node_id=?', [n.id]);
+      sqlRun('DELETE FROM win_auto_tag WHERE win_node_id=?', [n.id]);
+      sqlRun('DELETE FROM node WHERE id=?', [n.id]);
+      count++;
+    }
+  } else if (rule.action_type === 'move' && cfg.target_win_id) {
+    const kids = sqlQuery('SELECT COUNT(*) c FROM node WHERE parent_id=?', [cfg.target_win_id]);
+    let pos = kids[0]?.c ?? 0;
+    for (const n of nodes) {
+      if (n.node_type === 'tab' || n.node_type === 'savedtab') {
+        sqlRun(`UPDATE node SET parent_id=?, position=?, updated_at=datetime('now') WHERE id=?`,
+               [cfg.target_win_id, pos++, n.id]);
+        count++;
+      }
+    }
+  }
+  await persistDb();
+  return count;
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -476,7 +763,16 @@ async function onTabCreated(tab) {
   let pid = null;
   if (tab.openerTabId) pid = await tabDbId(tab.openerTabId);
   if (pid == null)     pid = await winDbId(tab.windowId);
-  await upsertTab(tab, pid);
+  const newTabId = await upsertTab(tab, pid);
+  // Apply any auto-tags configured on the parent window
+  const winId = await winDbId(tab.windowId);
+  if (winId) {
+    const autoTags = sqlQuery('SELECT tag_id FROM win_auto_tag WHERE win_node_id=?', [winId]);
+    for (const at of autoTags) {
+      sqlRun('INSERT OR IGNORE INTO node_tag (node_id, tag_id) VALUES (?,?)', [newTabId, at.tag_id]);
+    }
+    if (autoTags.length) await persistDb();
+  }
 }
 
 async function onTabRemoved(tabId, _info) {
