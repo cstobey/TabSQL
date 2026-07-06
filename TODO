@@ -1,0 +1,6 @@
+1. after runnnig a search, add a button to move search results into a new window.
+2. add tags to nodes. tags are user-defined text and color that are stored in their own table. tags are attached to nodes through a linking table.
+3. update search to allow terms to be applied to individual fields by prepending them with the field name and a colon. Add a generated feild to the node table called domain that takes the url and parses out just the hostname to make searching for a domain easier. also make sure that labels can be targeted with `label:`
+4. when searching, add the ability to label all found nodes with a label. when labeling a window, label all nodes in the window and any future nodes in that window. when removing a label from a window, leave the label on the existing nodes and just turn off the auto labeling of future nodes. 
+5. add the ability to add custom actions that add labels or move tabs to certain windows based off either a search string or SQL statement. 
+6. add something to show the schema for the SQL console... probably needs to be its own popup.

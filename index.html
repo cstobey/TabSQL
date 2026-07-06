@@ -18,6 +18,7 @@
     --win-icon: #f9c74f;
     --tab-icon: #90e0ef;
     --note-icon:#a8dadc;
+    --search-hl:#5a4a00;
     --indent:   16px;
     --row-h:    28px;
   }
@@ -107,6 +108,8 @@
   .ctx-item { padding: 6px 14px; cursor: pointer; font-size: 12px; }
   .ctx-item:hover { background: var(--hover); }
   .ctx-sep  { border-top: 1px solid var(--border); margin: 3px 0; }
+
+  mark.search-hl { background: var(--search-hl); color: inherit; border-radius: 2px; padding: 0 1px; }
 
   /* Note rows */
   .note-row { display: flex; align-items: center; font-size: 11px; color: var(--muted); min-height: 18px; }

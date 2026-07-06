@@ -84,20 +84,47 @@ function escHtml(s) {
   return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+function highlightText(text, q) {
+  if (!q || !text) return escHtml(text ?? '');
+  const parts = [];
+  const lower = text.toLowerCase();
+  const len   = q.length;
+  let i = 0;
+  while (i < text.length) {
+    const found = lower.indexOf(q, i);
+    if (found === -1) { parts.push(escHtml(text.slice(i))); break; }
+    parts.push(escHtml(text.slice(i, found)));
+    parts.push(`<mark class="search-hl">${escHtml(text.slice(found, found + len))}</mark>`);
+    i = found + len;
+  }
+  return parts.join('');
+}
+
+function matchesSearch(n, q) {
+  return [n.title, n.url, n.favicon_url, n.note_text, n.custom_title,
+          n.custom_favicon, n.color_active, n.color_saved, n.relicons, n.win_rect]
+    .some(f => f && String(f).toLowerCase().includes(q));
+}
+
 function setStatus(msg) {
   document.getElementById('status').textContent = msg;
 }
 
 // ── Build tree HTML ───────────────────────────────────────────────────────────
+// searchOpts: { visibleIds: Set, q: string } | null
 
-function buildTree(parentId = null, depth = 0) {
-  const children = childrenOf(parentId);
+function buildTree(parentId = null, depth = 0, searchOpts = null) {
+  const allChildren = childrenOf(parentId);
+  const children    = searchOpts
+    ? allChildren.filter(n => searchOpts.visibleIds.has(n.id))
+    : allChildren;
   if (!children.length) return '';
 
   return children.map(n => {
-    const kids    = childrenOf(n.id);
-    const hasKids = kids.length > 0;
-    const isColl  = collapsed.has(n.id);
+    const allKids = childrenOf(n.id);
+    const visKids = searchOpts ? allKids.filter(k => searchOpts.visibleIds.has(k.id)) : allKids;
+    const hasKids = visKids.length > 0;
+    const isColl  = searchOpts ? false : collapsed.has(n.id);
     const isOpen  = n.is_open === 1;
     const indent  = depth * 16;
     const label   = nodeLabel(n);
@@ -106,7 +133,7 @@ function buildTree(parentId = null, depth = 0) {
 
     const winType = (n.node_type === 'win' || n.node_type === 'savedwin') && n.relicons && n.relicons !== 'normal'
       ? `<span class="badge" style="color:var(--accent);opacity:.7">${escHtml(n.relicons)}</span>` : '';
-    const badge   = hasKids ? `<span class="badge">${kids.length}</span>` : '';
+    const badge   = hasKids ? `<span class="badge">${visKids.length}</span>` : '';
     const toggle  = hasKids
       ? `<span class="toggle">${isColl ? '▶' : '▼'}</span>`
       : `<span class="toggle"></span>`;
@@ -116,29 +143,33 @@ function buildTree(parentId = null, depth = 0) {
       faviconHtml = `<img class="favicon" src="${escHtml(n.favicon_url)}" onerror="this.style.display='none'">`;
     }
 
-    const editBtn  = `<button class="act act-edit" data-id="${n.id}" title="Edit note">✎</button>`;
-    const saveBtn  = (n.node_type === 'tab')
+    const labelHtml = searchOpts ? highlightText(label, searchOpts.q) : escHtml(label);
+    const noteText  = n.note_text || '';
+    const noteHtml  = searchOpts ? highlightText(noteText, searchOpts.q) : escHtml(noteText);
+
+    const editBtn = `<button class="act act-edit" data-id="${n.id}" title="Edit note">✎</button>`;
+    const saveBtn = (n.node_type === 'tab')
       ? `<button class="act act-save" data-id="${n.id}" title="Save &amp; close">💾</button>`
       : '';
-    const delBtn   = `<button class="act act-del" data-id="${n.id}" title="Delete">✕</button>`;
-    const actions  = `<span class="actions">${editBtn}${saveBtn}${delBtn}</span>`;
-    const noteRow  = `<div class="note-row${n.note_text ? '' : ' empty'}" data-note-for="${n.id}"
-                          style="padding-left:${indent + 20}px">
-                       <span class="note-bar">│</span>
-                       <span class="note-text">${escHtml(n.note_text || '')}</span>
-                     </div>`;
+    const delBtn  = `<button class="act act-del" data-id="${n.id}" title="Delete">✕</button>`;
+    const actions = `<span class="actions">${editBtn}${saveBtn}${delBtn}</span>`;
+    const noteRow = `<div class="note-row${noteText ? '' : ' empty'}" data-note-for="${n.id}"
+                         style="padding-left:${indent + 20}px">
+                      <span class="note-bar">│</span>
+                      <span class="note-text">${noteHtml}</span>
+                    </div>`;
 
     const cls = ['node', isOpen && isTab ? 'open-tab' : '', n.id === selected ? 'selected' : '']
       .filter(Boolean).join(' ');
 
-    const kidHtml = hasKids && !isColl ? buildTree(n.id, depth + 1) : '';
+    const kidHtml = hasKids && !isColl ? buildTree(n.id, depth + 1, searchOpts) : '';
 
     return `<div class="${cls}" data-id="${n.id}" data-type="${n.node_type}"
                  draggable="true"
                  style="padding-left:${indent + 4}px" title="${escHtml(n.url || '')}">
               ${toggle}
               ${faviconHtml || `<span class="icon">${icon}</span>`}
-              <span class="label ${label ? '' : 'muted'}">${escHtml(label)}</span>
+              <span class="label ${label ? '' : 'muted'}">${labelHtml}</span>
               ${winType}${badge}
               ${actions}
             </div>
@@ -153,31 +184,23 @@ function render(nodes, filter = '') {
   const treeEl = document.getElementById('tree');
   if (filter) {
     const q = filter.toLowerCase();
-    const matched = allNodes.filter(n =>
-      (n.title||'').toLowerCase().includes(q) ||
-      (n.url||'').toLowerCase().includes(q) ||
-      (n.note_text||'').toLowerCase().includes(q) ||
-      (n.custom_title||'').toLowerCase().includes(q)
-    );
-    treeEl.innerHTML = matched.map(n => {
-      const label   = nodeLabel(n);
-      const editBtn = `<button class="act act-edit" data-id="${n.id}" title="Edit note">✎</button>`;
-      const saveBtn = n.node_type === 'tab'
-        ? `<button class="act act-save" data-id="${n.id}" title="Save &amp; close">💾</button>` : '';
-      const noteRow = `<div class="note-row${n.note_text ? '' : ' empty'}" data-note-for="${n.id}"
-                            style="padding-left:20px">
-                         <span class="note-bar">│</span>
-                         <span class="note-text">${escHtml(n.note_text || '')}</span>
-                       </div>`;
-      return `<div class="node" data-id="${n.id}" data-type="${n.node_type}"
-                   draggable="true" style="padding-left:4px" title="${escHtml(n.url || '')}">
-                <span class="toggle"></span>
-                <span class="icon">${nodeIcon(n)}</span>
-                <span class="label">${escHtml(label)}</span>
-                <span class="actions">${editBtn}${saveBtn}<button class="act act-del" data-id="${n.id}" title="Delete">✕</button></span>
-              </div>${noteRow}`;
-    }).join('');
-    setStatus(`${matched.length} results`);
+
+    const matchedIds = new Set(allNodes.filter(n => matchesSearch(n, q)).map(n => n.id));
+
+    // Collect matched nodes + all their ancestors
+    const visibleIds = new Set(matchedIds);
+    for (const id of matchedIds) {
+      let cur = nodeMap[id];
+      while (cur?.parent_id != null) {
+        if (visibleIds.has(cur.parent_id)) break; // already walked this branch
+        visibleIds.add(cur.parent_id);
+        cur = nodeMap[cur.parent_id];
+      }
+    }
+
+    const session = allNodes.find(n => n.node_type === 'session');
+    treeEl.innerHTML = buildTree(session ? session.id : null, 0, { visibleIds, q });
+    setStatus(`${matchedIds.size} result${matchedIds.size !== 1 ? 's' : ''}`);
     return;
   }
   const session = allNodes.find(n => n.node_type === 'session');
@@ -643,7 +666,8 @@ const COLOR_VARS = [
   { prop: '--hover',     label: 'Row hover',   def: '#313145' },
   { prop: '--win-icon',  label: 'Window icon', def: '#f9c74f' },
   { prop: '--tab-icon',  label: 'Tab icon',    def: '#90e0ef' },
-  { prop: '--note-icon', label: 'Note icon',   def: '#a8dadc' },
+  { prop: '--note-icon', label: 'Note icon',      def: '#a8dadc' },
+  { prop: '--search-hl', label: 'Search highlight', def: '#5a4a00' },
 ];
 
 const THEME_KEY = 'tabsql_theme';
