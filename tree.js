@@ -20,6 +20,7 @@ const db = {
   moveNode(id, parent_id, position) { return this.send('move_node', { id, parent_id, position }); },
   upsertNode(node)                  { return this.send('upsert_node', { node }); },
   preOpenTab(nodeId, url)           { return this.send('pre_open_tab', { nodeId, url }); },
+  resync()                           { return this.send('resync'); },
 };
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -31,6 +32,7 @@ let selected    = null;
 let dragSrcId   = null;
 let allTags     = [];          // [{id, name, color}]
 let nodeTagsMap = {};          // nodeId → [{id, name, color}]
+let dupUrls    = new Set();    // URLs that appear more than once in the tree
 let tagPickerNodeId = null;    // which node the tag picker is open for
 
 // ── Load ──────────────────────────────────────────────────────────────────────
@@ -45,6 +47,9 @@ async function load() {
     ]);
     allNodes = all?.rows ?? [];
     nodeMap  = Object.fromEntries(allNodes.map(n => [n.id, n]));
+    const urlCounts = {};
+    for (const n of allNodes) if (n.url) urlCounts[n.url] = (urlCounts[n.url] || 0) + 1;
+    dupUrls = new Set(Object.keys(urlCounts).filter(u => urlCounts[u] > 1));
     allTags  = tagsR?.rows ?? [];
     // Build nodeTagsMap
     nodeTagsMap = {};
@@ -190,6 +195,7 @@ function buildTree(parentId = null, depth = 0, searchOpts = null) {
     const labelHtml = searchOpts ? highlightText(label, searchOpts.q) : escHtml(label);
     const noteText  = n.note_text || '';
     const noteHtml  = searchOpts ? highlightText(noteText, searchOpts.q) : escHtml(noteText);
+    const isDup     = n.url && dupUrls.has(n.url);
 
     const nodeTags = nodeTagsMap[n.id] ?? [];
     const tagChipsHtml = nodeTags.length
@@ -220,8 +226,10 @@ function buildTree(parentId = null, depth = 0, searchOpts = null) {
                  style="padding-left:${indent + 4}px" title="${escHtml(n.url || '')}">
               ${toggle}
               ${faviconHtml || `<span class="icon">${icon}</span>`}
-              <span class="label ${label ? '' : 'muted'}">${labelHtml}</span>
-              ${tagChipsHtml}
+              <span class="label-group">
+                <span class="label ${label ? '' : 'muted'}"${isDup ? ' style="color:var(--dup-url)"' : ''}>${labelHtml}</span>
+                ${tagChipsHtml}
+              </span>
               ${winType}${badge}
               ${actions}
             </div>
@@ -537,7 +545,10 @@ document.getElementById('search').addEventListener('input', e => {
 
 // ── Toolbar buttons ───────────────────────────────────────────────────────────
 
-document.getElementById('btn-refresh').addEventListener('click', load);
+document.getElementById('btn-refresh').addEventListener('click', async () => {
+  await db.resync();
+  await load();
+});
 
 // ── Live updates ──────────────────────────────────────────────────────────────
 
@@ -738,6 +749,7 @@ const COLOR_VARS = [
   { prop: '--tab-icon',  label: 'Tab icon',    def: '#90e0ef' },
   { prop: '--note-icon', label: 'Note icon',      def: '#a8dadc' },
   { prop: '--search-hl', label: 'Search highlight', def: '#5a4a00' },
+  { prop: '--dup-url',   label: 'Duplicate URL', def: '#f38ba8' },
 ];
 
 const THEME_KEY = 'tabsql_theme';
@@ -1075,7 +1087,12 @@ function renderTagPickerList(nodeId, currentTagIds, autoTagIds, isWin) {
         if (!chips) {
           chips = document.createElement('span');
           chips.className = 'tag-chips';
-          nodeEl.querySelector('.label').after(chips);
+          const labelGroup = nodeEl.querySelector('.label-group');
+          if (labelGroup) {
+            labelGroup.appendChild(chips);
+          } else {
+            nodeEl.querySelector('.label').after(chips);
+          }
         }
         chips.innerHTML = tags.map(t =>
           `<span class="tag-chip" style="background:${escHtml(t.color)}">${escHtml(t.name)}</span>`

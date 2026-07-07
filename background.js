@@ -128,6 +128,7 @@ function applySchema() {
   `);
   // Migrate: add domain column to existing DBs
   try { db.exec('ALTER TABLE node ADD COLUMN domain TEXT'); } catch {}
+  try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_chrome_uniq ON node (chrome_id)'); } catch {}
   // Populate domain for nodes that have a url but no domain yet
   const needsDomain = sqlQuery('SELECT id, url FROM node WHERE url IS NOT NULL AND (domain IS NULL OR domain = "")');
   for (const n of needsDomain) {
@@ -544,6 +545,10 @@ async function handleMessage(cmd, payload) {
       return { ok: true, schema: result };
     }
 
+    case 'resync':
+      await resync();
+      return { ok: true };
+
     default:
       throw new Error(`Unknown command: ${cmd}`);
   }
@@ -671,14 +676,82 @@ async function tabDbId(chromeTabId) {
   return rows[0]?.id ?? null;
 }
 
-async function initialize() {
+async function resync() {
   await ensureDb();
   const wins = await chrome.windows.getAll({ populate: true });
+
+  const currentWinIds = new Set(wins.map(w => w.id));
+  const currentTabIds = new Set();
+  for (const w of wins) for (const t of (w.tabs ?? [])) currentTabIds.add(t.id);
+
   for (const win of wins) {
-    const wid = await upsertWin(win);
-    for (const tab of (win.tabs ?? [])) await upsertTab(tab, wid);
+    const existingWin = sqlQuery(
+      `SELECT id FROM node WHERE chrome_id=? AND node_type IN ('win','savedwin') LIMIT 1`,
+      [win.id]
+    )[0];
+    const winNode = {
+      node_type: 'win', is_open: 1, chrome_id: win.id,
+      win_rect: `${win.left}_${win.top}_${win.width}_${win.height}`,
+      relicons:  win.type ?? 'normal',
+    };
+    if (existingWin) winNode.id = existingWin.id;
+    const wid = upsertNode(winNode);
+
+    for (const tab of (win.tabs ?? [])) {
+      const existingTab = sqlQuery(
+        `SELECT id FROM node WHERE chrome_id=? AND node_type IN ('tab','savedtab') LIMIT 1`,
+        [tab.id]
+      )[0];
+      const tabNode = {
+        node_type: 'tab', is_open: 1, chrome_id: tab.id,
+        title: tab.title ?? '', url: tab.url ?? '', favicon_url: tab.favIconUrl ?? '',
+        position: tab.index ?? 0,
+      };
+      if (existingTab) {
+        tabNode.id = existingTab.id;
+      } else {
+        tabNode.parent_id = wid;
+      }
+      upsertNode(tabNode);
+    }
   }
+
+  // Mark stale open tabs as savedtab
+  const staleTabs = sqlQuery(
+    `SELECT id, chrome_id FROM node WHERE node_type='tab' AND is_open=1 AND chrome_id IS NOT NULL`
+  );
+  for (const row of staleTabs) {
+    if (!currentTabIds.has(row.chrome_id)) {
+      sqlRun(
+        `UPDATE node SET node_type='savedtab', is_open=0, chrome_id=NULL, updated_at=datetime('now') WHERE id=?`,
+        [row.id]
+      );
+    }
+  }
+
+  // Mark stale open windows as savedwin (or delete if no saved content)
+  const staleWins = sqlQuery(
+    `SELECT id, chrome_id FROM node WHERE node_type='win' AND is_open=1 AND chrome_id IS NOT NULL`
+  );
+  for (const row of staleWins) {
+    if (!currentWinIds.has(row.chrome_id)) {
+      deleteOpenDescendants(row.id, null);
+      if (hasSavedDescendants(row.id)) {
+        sqlRun(
+          `UPDATE node SET node_type='savedwin', is_open=0, chrome_id=NULL, updated_at=datetime('now') WHERE id=?`,
+          [row.id]
+        );
+      } else {
+        sqlRun('DELETE FROM node WHERE id=?', [row.id]);
+      }
+    }
+  }
+
   await persistDb();
+}
+
+async function initialize() {
+  await resync();
   console.log('TabSQL initialized');
 }
 
@@ -714,6 +787,11 @@ async function onWindowCreated(win) { await upsertWin(win); }
 
 async function onWindowRemoved(winId) {
   await ensureDb();
+  const { popupWinId } = await chrome.storage.session.get('popupWinId');
+  if (winId === popupWinId) {
+    await chrome.storage.session.remove('popupWinId');
+    return;
+  }
   const winRow = sqlQuery(`SELECT id FROM node WHERE node_type='win' AND chrome_id=? LIMIT 1`, [winId])[0];
   if (!winRow) return;
   // onTabRemoved already fired for each tab; clean up any stragglers and re-parent saved content
@@ -814,17 +892,40 @@ chrome.tabs.onUpdated.addListener(guard(onTabUpdated));
 chrome.tabs.onMoved.addListener(guard(onTabMoved));
 
 // ---------------------------------------------------------------------------
-// UI
+// UI — popup lifecycle
 // ---------------------------------------------------------------------------
 
-chrome.action.onClicked.addListener(() => {
-  chrome.windows.create({
+async function openOrFocusPopup() {
+  const { popupWinId } = await chrome.storage.session.get('popupWinId');
+  if (popupWinId != null) {
+    try {
+      await chrome.windows.update(popupWinId, { focused: true });
+      return;
+    } catch {} // window was closed
+  }
+  const win = await chrome.windows.create({
     url: chrome.runtime.getURL('index.html'),
     type: 'popup', width: 400, height: 800,
   });
+  await chrome.storage.session.set({ popupWinId: win.id });
+}
+
+chrome.action.onClicked.addListener(() => {
+  openOrFocusPopup().catch(e => console.error('openPopup:', e));
 });
 chrome.commands.onCommand.addListener(cmd => {
-  if (cmd === 'open_sidebar') chrome.action.onClicked.dispatch();
+  if (cmd === 'open_sidebar') openOrFocusPopup().catch(console.error);
+});
+
+// On extension reload: close the stale popup window and reopen it
+chrome.runtime.onInstalled.addListener(details => {
+  if (details.reason !== 'update') return;
+  chrome.storage.session.get('popupWinId').then(async ({ popupWinId }) => {
+    if (popupWinId == null) return;
+    try { await chrome.windows.remove(popupWinId); } catch {}
+    await chrome.storage.session.remove('popupWinId');
+    await openOrFocusPopup();
+  }).catch(console.error);
 });
 
 // ---------------------------------------------------------------------------

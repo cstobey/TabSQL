@@ -1,2 +1,9 @@
-1. duplicate urls should be labeled with a configurable text color (default red).
-2. 
+next to the search, in addition to the Open results in a new window, and apply tag to search results, add save and close all search results, and close all search results. all such actions should only operate on the leaf nodes. 
+Open results in new window needs to move the found rows into the new window, not dulpicate the tabs/nodes. This means moving the tabs with chrome
+windows should have the save icon just like tabs, and it should save and close all the tabs in the window.  
+Add the action type: save on close. on a close event, check actions of that type and save the tab if it matches.  
+When I close a window in TabSQL, it should close the chrome window that is assocciated with it. 
+for duplicate nodes, replae the red text with a red (or whatever color is configured) circle that prepends the node. Also, the duplicate calculation is not being refreshed. when a duplicate node is deleted, the other nodes that match it should be checked to see if they are still duplicates and then updated if they aren't. When a tab is added, it needs to be checked against any nodes that match it to see if it is a duplicate and update all the nodes with that state. duplicates should definitely be recalculated when the reload tree button is pushed.  
+The node that has focus should be highlighted with a light background (default blue, but editable in the config). That means, for each window that is opened (ie, not saved), the tab that is active in chrome needs to have the background, and whichever window the user has given focus (if any, because they could be on a different app) should have the same background over just the window node. 
+I want to replace the savedwin and savedtab enum values and instead add an is_saved field. This will allow for saving without closing and keep things cleaner.
+can we delete the management_ui?
