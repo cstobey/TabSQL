@@ -1,3 +1,5 @@
-I added a favicon.ico.  I want that used for the extention icon and the icon in the windows taskbar for the popup. 
+FYI: I added icons and linked them all up.  
 i want the extension icon in the chrome toolbar to have a badge number indication the total number of tabs currently opened.
 I want the node count at the bottom of the tree to reflect not just how many nodes there are, but also how many open tabs there are and how many open windows.
+add a key/value table to store configs in the database. the colors should be backed up there and refreshed on reload. additionally, remember the popup size and location in the config table and use those values when spawning the ppoup.
+Those js files are getting really big. Break them up safely by topics and put then into a js/ folder. keep the 2 top level js files where they are, just import the other files into them. 
