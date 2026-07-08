@@ -34,12 +34,40 @@ let allTags     = [];          // [{id, name, color}]
 let nodeTagsMap = {};          // nodeId → [{id, name, color}]
 let dupUrls    = new Set();    // URLs that appear more than once in the tree
 let tagPickerNodeId = null;    // which node the tag picker is open for
+let focusState = { activeTabChromeIds: new Set(), focusedWinChromeId: null };
+
+// ── Focus state ───────────────────────────────────────────────────────────────
+
+async function syncFocusState() {
+  const wins = await chrome.windows.getAll({ populate: true }).catch(() => []);
+  focusState.activeTabChromeIds = new Set();
+  focusState.focusedWinChromeId = null;
+  for (const w of wins) {
+    if (w.focused) focusState.focusedWinChromeId = w.id;
+    for (const t of (w.tabs ?? [])) {
+      if (t.active) focusState.activeTabChromeIds.add(t.id);
+    }
+  }
+}
+
+function applyFocusHighlights() {
+  treeEl.querySelectorAll('.focus-active').forEach(el => el.classList.remove('focus-active'));
+  for (const chromeId of focusState.activeTabChromeIds) {
+    const node = allNodes.find(n => n.chrome_id === chromeId);
+    if (node) treeEl.querySelector(`[data-id="${node.id}"]`)?.classList.add('focus-active');
+  }
+  if (focusState.focusedWinChromeId) {
+    const winNode = allNodes.find(n => n.node_type === 'win' && !n.is_saved && n.chrome_id === focusState.focusedWinChromeId);
+    if (winNode) treeEl.querySelector(`[data-id="${winNode.id}"]`)?.classList.add('focus-active');
+  }
+}
 
 // ── Load ──────────────────────────────────────────────────────────────────────
 
 async function load() {
   setStatus('Loading…');
   try {
+    await syncFocusState();
     const [all, tagsR, nodeTagsR] = await Promise.all([
       db.query('SELECT * FROM node ORDER BY parent_id NULLS FIRST, position'),
       db.send('get_tags'),
@@ -51,7 +79,6 @@ async function load() {
     for (const n of allNodes) if (n.url) urlCounts[n.url] = (urlCounts[n.url] || 0) + 1;
     dupUrls = new Set(Object.keys(urlCounts).filter(u => urlCounts[u] > 1));
     allTags  = tagsR?.rows ?? [];
-    // Build nodeTagsMap
     nodeTagsMap = {};
     for (const nt of (nodeTagsR?.rows ?? [])) {
       if (!nodeTagsMap[nt.node_id]) nodeTagsMap[nt.node_id] = [];
@@ -86,12 +113,16 @@ function allDescendantIds(nodeId) {
   return ids;
 }
 
+function recomputeDupUrls() {
+  const urlCounts = {};
+  for (const n of allNodes) if (n.url) urlCounts[n.url] = (urlCounts[n.url] || 0) + 1;
+  dupUrls = new Set(Object.keys(urlCounts).filter(u => urlCounts[u] > 1));
+}
+
 function nodeIcon(n) {
   switch(n.node_type) {
-    case 'win':          return n.relicons === 'popup' ? '🔲' : '🪟';
-    case 'savedwin':     return '📁';
-    case 'tab':          return '⬤';
-    case 'savedtab':     return '·';
+    case 'win':          return n.is_saved ? '📁' : (n.relicons === 'popup' ? '🔲' : '🪟');
+    case 'tab':          return n.is_saved ? '·' : '⬤';
     case 'textnote':     return '📝';
     case 'separatorline':return '—';
     case 'group':        return '▸';
@@ -110,7 +141,6 @@ function escHtml(s) {
 
 function highlightText(text, q) {
   if (!q || !text) return escHtml(text ?? '');
-  // Extract plain-text terms (not field-prefixed) for highlighting
   const terms = parseSearchTerms(q).filter(t => !t.field).map(t => t.value);
   if (!terms.length) return escHtml(text);
   let result = escHtml(text);
@@ -178,9 +208,9 @@ function buildTree(parentId = null, depth = 0, searchOpts = null) {
     const indent  = depth * 16;
     const label   = nodeLabel(n);
     const icon    = nodeIcon(n);
-    const isTab   = n.node_type === 'tab' || n.node_type === 'savedtab';
+    const isTab   = n.node_type === 'tab';
 
-    const winType = (n.node_type === 'win' || n.node_type === 'savedwin') && n.relicons && n.relicons !== 'normal'
+    const winType = n.node_type === 'win' && n.relicons && n.relicons !== 'normal'
       ? `<span class="badge" style="color:var(--accent);opacity:.7">${escHtml(n.relicons)}</span>` : '';
     const badge   = hasKids ? `<span class="badge">${visKids.length}</span>` : '';
     const toggle  = hasKids
@@ -196,6 +226,7 @@ function buildTree(parentId = null, depth = 0, searchOpts = null) {
     const noteText  = n.note_text || '';
     const noteHtml  = searchOpts ? highlightText(noteText, searchOpts.q) : escHtml(noteText);
     const isDup     = n.url && dupUrls.has(n.url);
+    const dupIndicator = isDup ? `<span class="dup-dot" title="Duplicate URL"></span>` : '';
 
     const nodeTags = nodeTagsMap[n.id] ?? [];
     const tagChipsHtml = nodeTags.length
@@ -205,9 +236,11 @@ function buildTree(parentId = null, depth = 0, searchOpts = null) {
       : '';
 
     const editBtn = `<button class="act act-edit" data-id="${n.id}" title="Edit note">✎</button>`;
-    const saveBtn = (n.node_type === 'tab')
+    const saveBtn = (n.node_type === 'tab' && !n.is_saved)
       ? `<button class="act act-save" data-id="${n.id}" title="Save &amp; close">💾</button>`
-      : '';
+      : (n.node_type === 'win' && !n.is_saved)
+        ? `<button class="act act-save-win" data-id="${n.id}" title="Save &amp; close window">💾</button>`
+        : '';
     const delBtn  = `<button class="act act-del" data-id="${n.id}" title="Delete">✕</button>`;
     const actions = `<span class="actions">${editBtn}${saveBtn}${delBtn}</span>`;
     const noteRow = `<div class="note-row${noteText ? '' : ' empty'}" data-note-for="${n.id}"
@@ -225,9 +258,10 @@ function buildTree(parentId = null, depth = 0, searchOpts = null) {
                  draggable="true"
                  style="padding-left:${indent + 4}px" title="${escHtml(n.url || '')}">
               ${toggle}
+              ${dupIndicator}
               ${faviconHtml || `<span class="icon">${icon}</span>`}
               <span class="label-group">
-                <span class="label ${label ? '' : 'muted'}"${isDup ? ' style="color:var(--dup-url)"' : ''}>${labelHtml}</span>
+                <span class="label ${label ? '' : 'muted'}">${labelHtml}</span>
                 ${tagChipsHtml}
               </span>
               ${winType}${badge}
@@ -244,17 +278,18 @@ function render(nodes, filter = '') {
   const treeEl = document.getElementById('tree');
   const searchWinBtn  = document.getElementById('btn-search-window');
   const tagSearchBtn  = document.getElementById('btn-tag-search');
+  const saveSearchBtn = document.getElementById('btn-save-search');
+  const closeSearchBtn = document.getElementById('btn-close-search');
   if (filter) {
     const q = filter.toLowerCase();
 
     const matchedIds = new Set(allNodes.filter(n => matchesSearch(n, q)).map(n => n.id));
 
-    // Collect matched nodes + all their ancestors
     const visibleIds = new Set(matchedIds);
     for (const id of matchedIds) {
       let cur = nodeMap[id];
       while (cur?.parent_id != null) {
-        if (visibleIds.has(cur.parent_id)) break; // already walked this branch
+        if (visibleIds.has(cur.parent_id)) break;
         visibleIds.add(cur.parent_id);
         cur = nodeMap[cur.parent_id];
       }
@@ -263,20 +298,26 @@ function render(nodes, filter = '') {
     const session = allNodes.find(n => n.node_type === 'session');
     treeEl.innerHTML = buildTree(session ? session.id : null, 0, { visibleIds, q });
     setStatus(`${matchedIds.size} result${matchedIds.size !== 1 ? 's' : ''}`);
-    searchWinBtn.style.display = matchedIds.size ? '' : 'none';
-    tagSearchBtn.style.display = matchedIds.size ? '' : 'none';
+    searchWinBtn.style.display  = matchedIds.size ? '' : 'none';
+    tagSearchBtn.style.display  = matchedIds.size ? '' : 'none';
+    saveSearchBtn.style.display = matchedIds.size ? '' : 'none';
+    closeSearchBtn.style.display = matchedIds.size ? '' : 'none';
+    applyFocusHighlights();
     return;
   }
-  searchWinBtn.style.display = 'none';
-  tagSearchBtn.style.display = 'none';
+  searchWinBtn.style.display  = 'none';
+  tagSearchBtn.style.display  = 'none';
+  saveSearchBtn.style.display = 'none';
+  closeSearchBtn.style.display = 'none';
   const session = allNodes.find(n => n.node_type === 'session');
   treeEl.innerHTML = buildTree(session ? session.id : null, 0);
+  applyFocusHighlights();
 }
 
 // ── Click handler (select + collapse + double-click) ─────────────────────────
 
 document.getElementById('tree').addEventListener('click', e => {
-  if (e.target.classList.contains('act')) return; // action buttons handled separately
+  if (e.target.classList.contains('act')) return;
 
   const node = e.target.closest('.node');
   if (!node) return;
@@ -294,24 +335,20 @@ document.getElementById('tree').addEventListener('click', e => {
   node.classList.add('selected');
 
   if (e.detail === 2) {
-    if (n?.node_type === 'win' && n?.chrome_id) {
-      // Focus open window
+    if (n?.node_type === 'win' && !n.is_saved && n?.chrome_id) {
       chrome.windows.update(n.chrome_id, { focused: true });
-    } else if (n?.node_type === 'savedwin') {
-      // Re-open all saved tabs in a new window, adopting the existing DB nodes
+    } else if (n?.node_type === 'win' && n.is_saved) {
       db.send('open_saved_window', { winNodeId: n.id })
         .then(() => scheduleRefresh())
         .catch(console.error);
     } else if (n?.is_open && n?.chrome_id) {
-      // Focus existing open tab
       chrome.tabs.get(n.chrome_id).then(tab => {
         chrome.tabs.update(n.chrome_id, { active: true });
         chrome.windows.update(tab.windowId, { focused: true });
       }).catch(() => {
         if (n.url) chrome.tabs.create({ url: n.url });
       });
-    } else if (n?.node_type === 'savedtab' && n?.url) {
-      // Re-open saved tab; background will adopt the node instead of creating a duplicate
+    } else if (n?.node_type === 'tab' && n.is_saved && n?.url) {
       db.preOpenTab(n.id, n.url).catch(() => {}).finally(() => {
         chrome.tabs.create({ url: n.url });
       });
@@ -373,24 +410,31 @@ document.getElementById('tree').addEventListener('click', async e => {
   }
 
   if (btn.classList.contains('act-save')) {
-    // Close the Chrome tab; background.js onTabRemoved will mark it savedtab.
-    // But if for some reason it doesn't, also force-update the node.
     if (n.chrome_id) {
       try { await chrome.tabs.remove(n.chrome_id); } catch {}
     }
-    await db.upsertNode({ id, node_type: 'savedtab', is_open: 0, chrome_id: null });
+    await db.upsertNode({ id, node_type: 'tab', is_saved: 1, is_open: 0, chrome_id: null });
     scheduleRefresh();
+    return;
+  }
+
+  if (btn.classList.contains('act-save-win')) {
+    await db.send('save_window', { winNodeId: id });
+    scheduleRefresh();
+    return;
   }
 
   if (btn.classList.contains('act-del')) {
     const descIds = allDescendantIds(id);
-    // Close chrome tab if open
-    if (n.chrome_id && n.is_open) {
+    if (n.node_type === 'win' && !n.is_saved && n.chrome_id) {
+      try { await chrome.windows.remove(n.chrome_id); } catch {}
+    } else if (n.chrome_id && n.is_open) {
       try { await chrome.tabs.remove(n.chrome_id); } catch {}
     }
-    await db.deleteNode(id); // background cascades to all descendants
+    await db.deleteNode(id);
     allNodes = allNodes.filter(x => !descIds.has(x.id));
     nodeMap  = Object.fromEntries(allNodes.map(x => [x.id, x]));
+    recomputeDupUrls();
     render(allNodes, document.getElementById('search').value);
   }
 });
@@ -441,10 +485,15 @@ ctx.addEventListener('click', async e => {
     const kidCount = descIds.size - 1;
     const suffix = kidCount > 0 ? ` and ${kidCount} child node${kidCount > 1 ? 's' : ''}` : '';
     if (confirm(`Delete "${nodeLabel(n)}"${suffix}?`)) {
-      if (n.chrome_id && n.is_open) { try { await chrome.tabs.remove(n.chrome_id); } catch {} }
+      if (n.node_type === 'win' && !n.is_saved && n.chrome_id) {
+        try { await chrome.windows.remove(n.chrome_id); } catch {}
+      } else if (n.chrome_id && n.is_open) {
+        try { await chrome.tabs.remove(n.chrome_id); } catch {}
+      }
       await db.deleteNode(selected);
       allNodes = allNodes.filter(x => !descIds.has(x.id));
       nodeMap  = Object.fromEntries(allNodes.map(x => [x.id, x]));
+      recomputeDupUrls();
       render(allNodes, document.getElementById('search').value);
     }
   }
@@ -479,17 +528,12 @@ treeEl.addEventListener('dragover', e => {
   const targetId = +node.dataset.id;
   if (targetId === dragSrcId) return;
 
-  // Mouse X relative to tree → which depth level the pointer indicates.
-  // Indent formula: level 0 = 4px, each level adds 16px.
   const treeRect  = treeEl.getBoundingClientRect();
   const mouseX    = e.clientX - treeRect.left;
   const indentPx  = parseInt(node.style.paddingLeft) || 4;
   const nodeLevel = Math.round((indentPx - 4) / 16);
   const hoverLevel = Math.max(0, Math.floor((mouseX - 4) / 16));
 
-  // Find effective parent: walk up from hovered node until we reach hoverLevel.
-  // hoverLevel >= nodeLevel → drop INTO the node (it becomes the parent).
-  // hoverLevel < nodeLevel  → dedent; ancestor at hoverLevel becomes parent.
   let parentId;
   if (hoverLevel >= nodeLevel) {
     parentId = targetId;
@@ -502,14 +546,12 @@ treeEl.addEventListener('dragover', e => {
     parentId = cur?.id ?? null;
   }
 
-  // Block drops that would create a cycle (parentId inside dragged subtree)
   if (parentId != null && allDescendantIds(dragSrcId).has(parentId)) return;
 
   e.preventDefault();
   e.dataTransfer.dropEffect = 'move';
   dropState = { parentId };
 
-  // Highlight the effective parent node
   treeEl.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
   if (parentId != null) {
     treeEl.querySelector(`[data-id="${parentId}"]`)?.classList.add('drag-over');
@@ -547,6 +589,7 @@ document.getElementById('search').addEventListener('input', e => {
 
 document.getElementById('btn-refresh').addEventListener('click', async () => {
   await db.resync();
+  await syncFocusState();
   await load();
 });
 
@@ -564,12 +607,30 @@ chrome.tabs.onUpdated.addListener(scheduleRefresh);
 chrome.windows.onCreated.addListener(scheduleRefresh);
 chrome.windows.onRemoved.addListener(scheduleRefresh);
 
+chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+  for (const chromeId of [...focusState.activeTabChromeIds]) {
+    const node = allNodes.find(n => n.chrome_id === chromeId);
+    if (node) {
+      const parentWin = nodeMap[node.parent_id];
+      if (parentWin && parentWin.chrome_id === windowId) {
+        focusState.activeTabChromeIds.delete(chromeId);
+      }
+    }
+  }
+  focusState.activeTabChromeIds.add(tabId);
+  applyFocusHighlights();
+});
+
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  focusState.focusedWinChromeId = windowId > 0 ? windowId : null;
+  applyFocusHighlights();
+});
+
 // ── SQL panel ─────────────────────────────────────────────────────────────────
 
 const sqlQuickEl = document.getElementById('sql-quick');
 let sqlLastRows  = [];
 
-// Load saved queries from DB and populate the <select>
 async function loadQuickQueries() {
   const r    = await db.send('get_quick_queries');
   const rows = r?.rows ?? [];
@@ -596,7 +657,7 @@ async function runSQL(sql) {
     sqlLastRows = rows;
     renderSqlTable(rows);
     statusEl.textContent = `${rows.length} row${rows.length !== 1 ? 's' : ''} · ${elapsed}ms`;
-    if (!/^\s*SELECT/i.test(sql)) load(); // refresh tree after mutations
+    if (!/^\s*SELECT/i.test(sql)) load();
   } catch(e) {
     resultsEl.innerHTML = `<div style="color:var(--red);padding:8px;font-size:12px">Error: ${escHtml(e.message)}</div>`;
     statusEl.textContent = 'Error';
@@ -631,7 +692,6 @@ sqlQuickEl.addEventListener('change', () => {
   if (!opt?.dataset.sql) return;
   document.getElementById('sql-input').value = opt.dataset.sql;
   runSQL(opt.dataset.sql);
-  // Keep selection so the user can delete/update it
 });
 
 // ── Save current query ────────────────────────────────────────────────────────
@@ -640,17 +700,15 @@ document.getElementById('sql-save-query').addEventListener('click', async () => 
   const sql = document.getElementById('sql-input').value.trim();
   if (!sql) return;
 
-  // If an existing query is selected, offer to update it
   const selOpt = sqlQuickEl.options[sqlQuickEl.selectedIndex];
   const selId  = selOpt?.value ? +selOpt.value : null;
   const selLabel = selOpt?.textContent ?? '';
 
   let label, id;
   if (selId) {
-    // prompt pre-filled with existing label; empty = save as new
     label = prompt(`Update "${selLabel}" or enter a new name to save a copy:`, selLabel);
-    if (label === null) return; // cancelled
-    id = (label.trim() === selLabel) ? selId : null; // same name → update; new name → insert
+    if (label === null) return;
+    id = (label.trim() === selLabel) ? selId : null;
     label = label.trim() || selLabel;
   } else {
     label = prompt('Query name:', '');
@@ -660,7 +718,6 @@ document.getElementById('sql-save-query').addEventListener('click', async () => 
 
   await db.send('save_quick_query', { id, label: label.trim(), sql });
   await loadQuickQueries();
-  // Re-select the just-saved query
   for (const opt of sqlQuickEl.options) {
     if (opt.dataset.sql === sql && opt.textContent === label.trim()) {
       sqlQuickEl.value = opt.value;
@@ -738,18 +795,19 @@ document.addEventListener('mouseup', () => {
 // ── Config panel ──────────────────────────────────────────────────────────────
 
 const COLOR_VARS = [
-  { prop: '--bg',        label: 'Background',  def: '#1e1e2e' },
-  { prop: '--surface',   label: 'Surface',     def: '#2a2a3e' },
-  { prop: '--border',    label: 'Border',      def: '#3a3a5a' },
-  { prop: '--accent',    label: 'Accent',      def: '#7c9ef8' },
-  { prop: '--text',      label: 'Text',        def: '#cdd6f4' },
-  { prop: '--muted',     label: 'Muted text',  def: '#6e6e8e' },
-  { prop: '--hover',     label: 'Row hover',   def: '#313145' },
-  { prop: '--win-icon',  label: 'Window icon', def: '#f9c74f' },
-  { prop: '--tab-icon',  label: 'Tab icon',    def: '#90e0ef' },
+  { prop: '--bg',        label: 'Background',     def: '#1e1e2e' },
+  { prop: '--surface',   label: 'Surface',        def: '#2a2a3e' },
+  { prop: '--border',    label: 'Border',         def: '#3a3a5a' },
+  { prop: '--accent',    label: 'Accent',         def: '#7c9ef8' },
+  { prop: '--text',      label: 'Text',           def: '#cdd6f4' },
+  { prop: '--muted',     label: 'Muted text',     def: '#6e6e8e' },
+  { prop: '--hover',     label: 'Row hover',      def: '#313145' },
+  { prop: '--win-icon',  label: 'Window icon',    def: '#f9c74f' },
+  { prop: '--tab-icon',  label: 'Tab icon',       def: '#90e0ef' },
   { prop: '--note-icon', label: 'Note icon',      def: '#a8dadc' },
   { prop: '--search-hl', label: 'Search highlight', def: '#5a4a00' },
-  { prop: '--dup-url',   label: 'Duplicate URL', def: '#f38ba8' },
+  { prop: '--dup-url',   label: 'Duplicate URL',  def: '#f38ba8' },
+  { prop: '--focus-bg',  label: 'Focus highlight', def: '#1a3a5c' },
 ];
 
 const THEME_KEY = 'tabsql_theme';
@@ -846,16 +904,20 @@ document.getElementById('cfg-export').addEventListener('click', async () => {
   }
 });
 
-// ── TabOutliner import (mirrors migrate.py logic) ─────────────────────────────
+// ── TabOutliner import ────────────────────────────────────────────────────────
 
 function parseTabOutlinerNode(raw) {
-  const ntype  = raw.type ?? 'savedtab';
+  let ntype = raw.type ?? 'tab';
+  let is_saved = 0;
+  if (ntype === 'savedtab') { ntype = 'tab'; is_saved = 1; }
+  else if (ntype === 'savedwin') { ntype = 'win'; is_saved = 1; }
   const marks  = raw.marks ?? {};
   const data   = raw.data  ?? {};
   return {
     node_type:      ntype,
+    is_saved,
     is_collapsed:   raw.colapsed ? 1 : 0,
-    is_open:        (ntype === 'win' || ntype === 'tab') ? 1 : 0,
+    is_open:        (ntype === 'win' || ntype === 'tab') && !is_saved ? 1 : 0,
     title:          data.title        ?? null,
     url:            data.url          ?? null,
     favicon_url:    data.favIconUrl   ?? null,
@@ -917,7 +979,11 @@ async function exportTabOutliner() {
     if (n.favicon_url) data.favIconUrl = n.favicon_url;
     if (n.note_text)   data.note       = n.note_text;
     if (n.win_rect)    data.rect       = n.win_rect;
-    return { type: n.node_type, colapsed: !!n.is_collapsed, data, marks };
+    // Map back to TabOutliner type names for compatibility
+    const exportType = (n.node_type === 'win' && n.is_saved) ? 'savedwin'
+                     : (n.node_type === 'tab' && n.is_saved) ? 'savedtab'
+                     : n.node_type;
+    return { type: exportType, colapsed: !!n.is_collapsed, data, marks };
   }
 
   const result = [{ type: 'TREE_CREATE', treeStorage: 'TabSQL export' }];
@@ -959,6 +1025,7 @@ CREATE TABLE IF NOT EXISTS node (
   position       INTEGER NOT NULL DEFAULT 0,
   is_collapsed   INTEGER NOT NULL DEFAULT 0,
   is_open        INTEGER NOT NULL DEFAULT 0,
+  is_saved       INTEGER NOT NULL DEFAULT 0,
   chrome_id      INTEGER DEFAULT NULL,
   title          TEXT,
   url            TEXT,
@@ -973,40 +1040,13 @@ CREATE TABLE IF NOT EXISTS node (
   created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
   updated_at     TEXT    NOT NULL DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_parent ON node (parent_id, position);
-CREATE INDEX IF NOT EXISTS idx_chrome ON node (chrome_id);
-CREATE INDEX IF NOT EXISTS idx_type   ON node (node_type);
-CREATE VIEW IF NOT EXISTS tab_flat AS
-  SELECT n.id, n.node_type, n.title, n.url, n.favicon_url,
-         n.is_open, n.is_collapsed, n.position,
-         n.custom_title, n.color_active, n.color_saved,
-         p.id AS parent_id, p.title AS parent_title, p.node_type AS parent_type,
-         n.created_at, n.updated_at
-  FROM node n LEFT JOIN node p ON n.parent_id = p.id
-  WHERE n.node_type IN ('tab','savedtab');
-CREATE VIEW IF NOT EXISTS window_summary AS
-  SELECT w.id, w.node_type,
-         COALESCE(w.custom_title, w.title, 'Untitled') AS title,
-         w.is_open, w.is_collapsed, w.win_rect, w.custom_favicon,
-         COUNT(t.id) AS tab_count, SUM(t.is_open) AS open_tab_count
-  FROM node w
-  LEFT JOIN node t ON t.parent_id = w.id AND t.node_type IN ('tab','savedtab')
-  WHERE w.node_type IN ('win','savedwin')
-  GROUP BY w.id;
-CREATE TABLE IF NOT EXISTS quick_query (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  label      TEXT    NOT NULL,
-  sql        TEXT    NOT NULL,
-  position   INTEGER NOT NULL DEFAULT 0,
-  is_default INTEGER NOT NULL DEFAULT 0
-);
 */`;
 
 async function exportSQL() {
   const r     = await db.query('SELECT * FROM node ORDER BY id');
   const nodes = r?.rows ?? [];
 
-  const cols = ['id','parent_id','node_type','position','is_collapsed','is_open',
+  const cols = ['id','parent_id','node_type','position','is_collapsed','is_open','is_saved',
                 'chrome_id','title','url','favicon_url','note_text','custom_title',
                 'custom_favicon','color_active','color_saved','relicons','win_rect',
                 'created_at','updated_at'];
@@ -1032,13 +1072,11 @@ const tagPickerListEl = document.getElementById('tag-picker-list');
 async function openTagPicker(nodeId, x, y) {
   tagPickerNodeId = nodeId;
   const n = nodeMap[nodeId];
-  const isWin = n?.node_type === 'win' || n?.node_type === 'savedwin';
+  const isWin = n?.node_type === 'win';
 
-  // Load current tags for this node
   const r = await db.send('get_node_tags', { nodeId });
   const currentTagIds = new Set((r?.rows ?? []).map(t => t.id));
 
-  // Load win auto-tags if applicable
   let autoTagIds = new Set();
   if (isWin) {
     const ar = await db.send('get_win_auto_tags', { winNodeId: nodeId });
@@ -1047,7 +1085,6 @@ async function openTagPicker(nodeId, x, y) {
 
   renderTagPickerList(nodeId, currentTagIds, autoTagIds, isWin);
 
-  // Position
   tagPickerEl.style.left = Math.min(x, window.innerWidth - 220) + 'px';
   tagPickerEl.style.top  = Math.min(y, window.innerHeight - 300) + 'px';
   tagPickerEl.classList.remove('hidden');
@@ -1069,7 +1106,6 @@ function renderTagPickerList(nodeId, currentTagIds, autoTagIds, isWin) {
     autoSection.classList.add('hidden');
   }
 
-  // Click to toggle tag
   tagPickerListEl.querySelectorAll('.tag-pick-row').forEach(row => {
     row.addEventListener('click', async e => {
       e.stopPropagation();
@@ -1077,9 +1113,7 @@ function renderTagPickerList(nodeId, currentTagIds, autoTagIds, isWin) {
       const wasOn = currentTagIds.has(tagId);
       if (wasOn) currentTagIds.delete(tagId); else currentTagIds.add(tagId);
       await db.send('set_node_tags', { nodeId: tagPickerNodeId, tagIds: [...currentTagIds] });
-      // Update nodeTagsMap locally
       nodeTagsMap[tagPickerNodeId] = allTags.filter(t => currentTagIds.has(t.id));
-      // Re-render the chip on the node row
       const nodeEl = treeEl.querySelector(`[data-id="${tagPickerNodeId}"]`);
       if (nodeEl) {
         let chips = nodeEl.querySelector('.tag-chips');
@@ -1104,9 +1138,6 @@ function renderTagPickerList(nodeId, currentTagIds, autoTagIds, isWin) {
 
   if (isWin) {
     const cb = document.getElementById('tag-picker-auto-cb');
-    // Checkbox state reflects whether ANY checked tag has auto-tagging on
-    // We'll use it as a per-open-operation toggle bound to the last clicked tag
-    // Simpler: show auto state for all current tags as a single checkbox
     cb.checked = [...currentTagIds].some(tid => autoTagIds.has(tid));
     cb.onchange = async () => {
       for (const tid of currentTagIds) {
@@ -1123,14 +1154,14 @@ document.getElementById('tag-picker-new-add').addEventListener('click', async e 
   const name  = document.getElementById('tag-picker-new-name').value.trim();
   const color = document.getElementById('tag-picker-new-color').value;
   if (!name) return;
-  const r = await db.send('save_tag', { name, color });
+  await db.send('save_tag', { name, color });
   await loadTags();
   document.getElementById('tag-picker-new-name').value = '';
   if (tagPickerNodeId != null) {
     const cr = await db.send('get_node_tags', { nodeId: tagPickerNodeId });
     const currentTagIds = new Set((cr?.rows ?? []).map(t => t.id));
     const n = nodeMap[tagPickerNodeId];
-    const isWin = n?.node_type === 'win' || n?.node_type === 'savedwin';
+    const isWin = n?.node_type === 'win';
     renderTagPickerList(tagPickerNodeId, currentTagIds, new Set(), isWin);
   }
 });
@@ -1146,7 +1177,24 @@ document.getElementById('btn-search-window').addEventListener('click', async () 
   const q = document.getElementById('search').value.trim();
   if (!q) return;
   const r = await db.send('open_search_in_window', { q });
-  setStatus(`Opened ${r?.opened ?? 0} tabs in new window`);
+  setStatus(`Moved ${r?.moved ?? 0} tabs to new window`);
+  scheduleRefresh();
+});
+
+document.getElementById('btn-save-search').addEventListener('click', async () => {
+  const q = document.getElementById('search').value.trim();
+  if (!q) return;
+  const r = await db.send('save_close_search', { q });
+  setStatus(`Saved and closed ${r?.count ?? 0} tabs`);
+  scheduleRefresh();
+});
+
+document.getElementById('btn-close-search').addEventListener('click', async () => {
+  const q = document.getElementById('search').value.trim();
+  if (!q) return;
+  const r = await db.send('close_search', { q });
+  setStatus(`Closed ${r?.count ?? 0} tabs`);
+  scheduleRefresh();
 });
 
 document.getElementById('btn-tag-search').addEventListener('click', async e => {
@@ -1156,10 +1204,9 @@ document.getElementById('btn-tag-search').addEventListener('click', async e => {
     return;
   }
   const q = document.getElementById('search').value.trim();
-  // Show a small floating picker to choose which tag to apply
   const btn = document.getElementById('btn-tag-search');
   const rect = btn.getBoundingClientRect();
-  tagPickerNodeId = null; // signal: applying to search results
+  tagPickerNodeId = null;
 
   const picker = document.getElementById('tag-picker');
   const autoSection = document.getElementById('tag-picker-win-auto');
@@ -1241,9 +1288,10 @@ async function loadCfgActions() {
   list.innerHTML = rules.map(r => {
     const cfg = r.config ? JSON.parse(r.config) : {};
     const tagName = cfg.tag_id ? (allTags.find(t => t.id === cfg.tag_id)?.name ?? '?') : '';
-    const badgeText = r.action_type === 'add_tag' ? `tag:${tagName}`
-                    : r.action_type === 'delete'  ? `delete${cfg.delay_days ? ` (${cfg.delay_days}d)` : ''}`
-                    : r.action_type === 'move'     ? 'move'
+    const badgeText = r.action_type === 'add_tag'      ? `tag:${tagName}`
+                    : r.action_type === 'delete'       ? `delete${cfg.delay_days ? ` (${cfg.delay_days}d)` : ''}`
+                    : r.action_type === 'move'         ? 'move'
+                    : r.action_type === 'save_on_close' ? 'save-on-close'
                     : r.action_type;
     return `
       <div class="action-row" data-rule-id="${r.id}">
@@ -1303,9 +1351,10 @@ function showActionEditor(existing) {
       <div class="action-editor-row">
         <label>Type</label>
         <select id="ae-type">
-          <option value="add_tag" ${existing?.action_type === 'add_tag' ? 'selected' : ''}>Add tag</option>
-          <option value="delete"  ${existing?.action_type === 'delete'  ? 'selected' : ''}>Delete</option>
-          <option value="move"    ${existing?.action_type === 'move'    ? 'selected' : ''}>Move to window</option>
+          <option value="add_tag"      ${existing?.action_type === 'add_tag'      ? 'selected' : ''}>Add tag</option>
+          <option value="delete"       ${existing?.action_type === 'delete'       ? 'selected' : ''}>Delete</option>
+          <option value="move"         ${existing?.action_type === 'move'         ? 'selected' : ''}>Move to window</option>
+          <option value="save_on_close" ${existing?.action_type === 'save_on_close' ? 'selected' : ''}>Save on close</option>
         </select>
       </div>
       <div class="action-editor-row" id="ae-tag-row">
@@ -1346,9 +1395,9 @@ function showActionEditor(existing) {
 
   function updateVisibility() {
     const type = document.getElementById('ae-type').value;
-    document.getElementById('ae-tag-row').style.display   = type === 'add_tag' ? '' : 'none';
-    document.getElementById('ae-delay-row').style.display = type === 'delete'  ? '' : 'none';
-    document.getElementById('ae-win-row').style.display   = type === 'move'    ? '' : 'none';
+    document.getElementById('ae-tag-row').style.display   = type === 'add_tag'      ? '' : 'none';
+    document.getElementById('ae-delay-row').style.display = type === 'delete'        ? '' : 'none';
+    document.getElementById('ae-win-row').style.display   = type === 'move'          ? '' : 'none';
   }
   updateVisibility();
   document.getElementById('ae-type').addEventListener('change', updateVisibility);

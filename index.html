@@ -21,6 +21,7 @@
     --search-hl:#5a4a00;
     --red:      #f38ba8;
     --dup-url:  #f38ba8;
+    --focus-bg: #1a3a5c;
     --indent:   16px;
     --row-h:    28px;
   }
@@ -74,19 +75,21 @@
 
   .toggle  { width: 14px; flex-shrink: 0; color: var(--muted); font-size: 10px; text-align: center; }
   .icon    { width: 16px; flex-shrink: 0; font-size: 12px; margin: 0 3px; }
+  .dup-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--dup-url); margin: 0 3px 0 0; flex-shrink: 0; }
   .label-group { flex: 1; min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 3px; overflow: hidden; }
   .label   { flex: 1 1 100px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .label.muted { color: var(--muted); }
   .badge   { font-size: 10px; color: var(--muted); margin-left: 4px; flex-shrink: 0; }
   .favicon { width: 14px; height: 14px; object-fit: contain; margin: 0 3px; flex-shrink: 0; }
 
-  .node[data-type="win"] .label,
-  .node[data-type="savedwin"] .label { font-weight: 500; color: var(--win-icon); }
+  .node[data-type="win"] .label { font-weight: 500; color: var(--win-icon); }
   .node[data-type="group"] .label    { font-weight: 600; color: var(--accent); }
   .node[data-type="textnote"] .label { color: var(--note-icon); font-style: italic; }
   .node[data-type="separatorline"]   { border-top: 1px solid var(--border); margin: 2px 0; height: 1px; }
 
   .node.open-tab .label  { color: var(--tab-icon); }
+  .node.focus-active { background: var(--focus-bg); }
+  .node.focus-active:hover { background: var(--focus-bg); filter: brightness(1.15); }
   .node.collapsed > .children { display: none; }
 
   .children { /* indented by JS via padding-left on child nodes */ }
@@ -239,7 +242,9 @@
 
 <div id="toolbar">
   <input id="search" type="search" placeholder="Search… (field:value)" autocomplete="off">
-  <button class="btn" id="btn-search-window" title="Open results in new window" style="display:none">⬡</button>
+  <button class="btn" id="btn-search-window" title="Move results to new window" style="display:none">⬡</button>
+  <button class="btn" id="btn-save-search" title="Save and close search results" style="display:none">💾</button>
+  <button class="btn" id="btn-close-search" title="Close search results" style="display:none">✕</button>
   <button class="btn" id="btn-tag-search" title="Apply tag to search results" style="display:none">🏷</button>
   <button class="btn" id="btn-refresh" title="Reload tree">↺</button>
   <button class="btn" id="btn-config" title="Settings">⚙</button>

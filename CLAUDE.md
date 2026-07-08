@@ -11,7 +11,6 @@ Chrome extension (Manifest V3) that manages browser tabs in a persistent tree vi
 | `background.js` | MV3 service worker. All DB operations, Chrome event listeners, message handler. |
 | `tree.js` | Sidebar UI logic. Sends messages to background, renders tree, handles drag/drop, SQL panel. |
 | `index.html` | Sidebar shell — all CSS lives here. |
-| `management_ui.html` | Legacy standalone SQL console (mostly superseded by the embedded panel in `index.html`). |
 | `manifest.json` | Extension manifest. Permissions: `tabs`, `windows`, `storage`, `unlimitedStorage`, `clipboardWrite`. |
 | `sql-wasm.js` / `sql-wasm.wasm` | sql.js library — SQLite compiled to WASM. |
 
@@ -22,11 +21,12 @@ Chrome extension (Manifest V3) that manages browser tabs in a persistent tree vi
 ```
 id            INTEGER PK AUTOINCREMENT
 parent_id     INTEGER → node(id)
-node_type     TEXT  -- 'win' | 'savedwin' | 'tab' | 'savedtab' | 'group' | 'textnote' | 'session' | 'separatorline'
+node_type     TEXT  -- 'win' | 'tab' | 'group' | 'textnote' | 'session' | 'separatorline'
 position      INTEGER
 is_collapsed  INTEGER (0/1)
 is_open       INTEGER (0/1)
-chrome_id     INTEGER  -- Chrome window/tab ID; NULL for saved nodes
+is_saved      INTEGER (0/1)  -- 1 = saved/closed (replaces old savedwin/savedtab node_type values)
+chrome_id     INTEGER  -- Chrome window/tab ID; NULL when is_saved=1
 title         TEXT
 url           TEXT
 domain        TEXT  -- hostname extracted from url, auto-populated by upsertNode
@@ -44,9 +44,11 @@ updated_at    TEXT  -- datetime('now')
 
 `domain` is auto-populated by `extractDomain(url)` in `upsertNode` whenever `url` is set. Migrated for existing rows in `applySchema()`.
 
+`is_saved`: distinguishes open vs saved state without needing separate node_type values. `win + is_saved=0` = open window, `win + is_saved=1` = saved/closed window. Same for `tab`. Old `savedtab`/`savedwin` rows are auto-migrated on startup.
+
 ### Views
-- `tab_flat` — tabs/savedtabs joined with their parent info
-- `window_summary` — windows with tab counts
+- `tab_flat` — all tab nodes joined with their parent info
+- `window_summary` — all win nodes with tab counts
 
 ### `quick_query` table
 ```
@@ -84,7 +86,7 @@ Removing a win_auto_tag entry stops future auto-tagging but does NOT remove the 
 ```
 id             INTEGER PK AUTOINCREMENT
 name           TEXT
-action_type    TEXT  -- 'add_tag' | 'delete' | 'move'
+action_type    TEXT  -- 'add_tag' | 'delete' | 'move' | 'save_on_close'
 condition_type TEXT  -- 'search' | 'sql'
 condition      TEXT  -- search string or SQL SELECT
 config         TEXT  -- JSON: {tag_id?, delay_days?, target_win_id?}
@@ -93,15 +95,15 @@ position       INTEGER
 created_at     TEXT
 ```
 
+`save_on_close`: when `is_auto=1`, any tab closed whose node matches the condition is saved (`is_saved=1`) instead of deleted. Running the rule manually saves and closes all matching open tabs.
+
 ## Node types
 
 | Type | Meaning |
 |---|---|
 | `session` | Root node — single top-level container |
-| `win` | Open Chrome window (`chrome_id` set, `is_open=1`) |
-| `savedwin` | Closed window with saved tab children |
-| `tab` | Open Chrome tab (`chrome_id` set, `is_open=1`) |
-| `savedtab` | Saved (closed) tab — persisted URL/title, no `chrome_id` |
+| `win` | Chrome window — `is_saved=0` when open (`chrome_id` set, `is_open=1`), `is_saved=1` when closed/saved |
+| `tab` | Chrome tab — `is_saved=0` when open (`chrome_id` set, `is_open=1`), `is_saved=1` when saved/closed |
 | `group` | User-defined folder |
 | `textnote` | Freeform text note |
 | `separatorline` | Visual divider |
@@ -133,14 +135,17 @@ function upsertNode(node) {
 ```
 Safe to call with `{ id, note_text: val }` — won't clobber other fields.
 
-### pendingAdopt — open a savedtab without creating a duplicate node
+### pendingAdopt — open a saved tab without creating a duplicate node
 When tree.js wants to re-open a saved tab, it calls `pre_open_tab` BEFORE `chrome.tabs.create`. `onTabCreated` then checks `pendingAdopt` (5s TTL) and updates the existing node's `chrome_id` instead of inserting a new row.
 
 ### adoptedTabIds — bulk window reopen
-`open_saved_window` handler opens all tabs via `chrome.windows.create`, matches them 1:1 to `savedtab` nodes, and adds all Chrome tab IDs to `adoptedTabIds`. `onTabCreated` skips any ID in this set.
+`open_saved_window` handler opens all tabs via `chrome.windows.create`, matches them 1:1 to saved tab nodes, and adds all Chrome tab IDs to `adoptedTabIds`. `onTabCreated` skips any ID in this set.
 
 ### chrome_id dedup in initialize()
 `upsertWin` and `upsertTab` look up existing nodes by `chrome_id` first. If found, they pass `id` into `upsertNode` (UPDATE path) without changing `parent_id`. This prevents duplicates when the service worker restarts.
+
+### save_on_close action rule
+`onTabRemoved` checks `is_auto=1` rules with `action_type='save_on_close'` before deleting a tab node. If the closed tab matches any rule's condition, the node is updated to `is_saved=1, is_open=0, chrome_id=NULL` instead of being deleted.
 
 ## Message protocol (background.js ↔ tree.js)
 
@@ -155,8 +160,11 @@ All messages: `{ to: 'background', cmd, payload }` → response `{ ok, data }` o
 | `get_node` | `{ id }` | `{ row }` |
 | `search` | `{ q }` | `{ rows }` — supports field-prefix syntax |
 | `pre_open_tab` | `{ nodeId, url }` | sets pendingAdopt |
-| `open_saved_window` | `{ winNodeId }` | opens all savedtab children in new window |
-| `open_search_in_window` | `{ q }` | opens matching tab/savedtab URLs in new window |
+| `open_saved_window` | `{ winNodeId }` | opens all saved tab children in new window, adopts existing nodes |
+| `save_window` | `{ winNodeId }` | marks all open tabs as saved, then closes the Chrome window |
+| `open_search_in_window` | `{ q }` | moves matching leaf tab nodes to a new window (moves open tabs via chrome.tabs.move, opens fresh for saved tabs reusing existing nodes) |
+| `save_close_search` | `{ q }` | saves and closes all matching leaf tab nodes |
+| `close_search` | `{ q }` | closes (discards) all matching open leaf tab nodes |
 | `get_quick_queries` | — | `{ rows }` |
 | `save_quick_query` | `{ id?, label, sql }` | upsert by id |
 | `delete_quick_query` | `{ id }` | — |
@@ -191,6 +199,12 @@ const db = {
 };
 ```
 
+### Focus highlighting
+`focusState` tracks `activeTabChromeIds` (one per open window) and `focusedWinChromeId`. `syncFocusState()` polls `chrome.windows.getAll` on load and manual refresh. `chrome.tabs.onActivated` and `chrome.windows.onFocusChanged` update state surgically. `applyFocusHighlights()` adds/removes `.focus-active` class. Configurable via `--focus-bg` CSS variable.
+
+### Duplicate URL indicator
+`dupUrls` Set is computed in `load()` and after any delete. Duplicate nodes show a colored circle (`.dup-dot`) prepended before the icon, colored `--dup-url`.
+
 ### Drag-to-dedent
 Mouse X position relative to tree → `hoverLevel = floor((mouseX - 4) / 16)`. If `hoverLevel < nodeLevel`, walk up ancestors `(nodeLevel - hoverLevel)` steps to find effective parent.
 
@@ -205,10 +219,11 @@ Debounced `load()` call (600ms) triggered by Chrome tab/window events and after 
 
 ## CSS conventions (index.html)
 
-- CSS custom properties in `:root`: `--bg`, `--surface`, `--border`, `--accent`, `--text`, `--muted`, `--hover`, `--win-icon`, `--tab-icon`, `--indent` (16px), `--row-h` (28px)
+- CSS custom properties in `:root`: `--bg`, `--surface`, `--border`, `--accent`, `--text`, `--muted`, `--hover`, `--win-icon`, `--tab-icon`, `--focus-bg`, `--dup-url`, `--indent` (16px), `--row-h` (28px)
 - `.node` rows use `padding-left: (depth * 16 + 4)px` for indentation — not nested divs
 - `.actions` hidden by default, shown on `.node:hover`
 - `.node.open-tab .label` → tab-icon color for open tabs
+- `.node.focus-active` → focus-bg highlight for active tab in each window and the focused window node
 - `#sql-resize` is a 5px drag handle between tree and SQL panel; `mousemove` on `document` adjusts `#sql-panel` height
 
 ## Coding conventions
@@ -217,7 +232,7 @@ Debounced `load()` call (600ms) triggered by Chrome tab/window events and after 
 - No confirmation dialogs on delete
 - No feature flags or backwards-compat shims
 - Prefer targeted DOM mutations over full re-renders when only one node changes
-- `escHtml()` is defined in both tree.js and management_ui.html — keep them in sync if modified
+- `escHtml()` is defined in tree.js
 
 ## Known constraints
 
