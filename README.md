@@ -19,17 +19,35 @@ A Chrome extension that manages browser tabs in a persistent tree view, backed b
 - **Opener hierarchy** — tabs opened from other tabs are nested under their opener
 - **Tab position sync** — tab bar position is tracked and restored when a saved tab is reopened
 - **Live updates** — tree refreshes automatically as tabs are opened/closed/moved
+- **Toolbar badge** — extension icon shows the count of currently open tabs; updates live
+- **Persistent colors** — theme colors are stored in the database and survive a full extension reload
+- **Popup memory** — popup window size and position are remembered and restored on next open
 
 ## File structure
 
 ```
 TabSQL/
   manifest.json        Chrome extension manifest (MV3)
-  background.js        Service worker — all DB logic and Chrome event handling
+  background.js        Service worker entry point — imports js/bg-*.js, handles messages
   index.html           Sidebar UI shell and all CSS
-  tree.js              Sidebar UI logic
+  tree.js              Sidebar UI entry point (ES module) — imports js/*.js and boots
   sql-wasm.js          sql.js library
   sql-wasm.wasm        SQLite compiled to WASM
+  js/
+    bg-db.js           DB init, schema, persistence, SQL helpers, node upsert
+    bg-rules.js        Action rule execution
+    bg-sync.js         Chrome tab/window sync, event handlers, badge updates
+    bg-popup.js        Popup open/focus/resize lifecycle
+    state.js           Shared mutable state (allNodes, nodeMap, tags, …)
+    db-api.js          Sidebar→background message wrapper (db.send / db.query)
+    helpers.js         Pure helpers: escHtml, parseSearchTerms, nodeIcon, …
+    focus.js           Focus state sync and highlight application
+    render.js          Tree build/render, load(), loadTags()
+    events.js          All DOM event listeners (click, drag, search, toolbar)
+    sql-panel.js       SQL panel UI, quick queries, schema popup, resize
+    config.js          Color theme panel, import/export (TabOutliner + SQL)
+    tags.js            Tag picker overlay, config tags panel
+    actions-cfg.js     Config actions panel, action editor
 ```
 
 ## Setup
@@ -167,7 +185,7 @@ WHERE note_text IS NOT NULL ORDER BY updated_at DESC;
 
 ## Data model
 
-All nodes live in the `node` table. Tags are in `tag` / `node_tag`. Window auto-tags in `win_auto_tag`. Automation rules in `action_rule`.
+All nodes live in the `node` table. Tags are in `tag` / `node_tag`. Window auto-tags in `win_auto_tag`. Automation rules in `action_rule`. Key/value settings (theme colors, popup geometry) in `config`.
 
 ```
 node_type   is_saved   chrome_id   is_open   meaning

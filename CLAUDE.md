@@ -8,11 +8,25 @@ Chrome extension (Manifest V3) that manages browser tabs in a persistent tree vi
 
 | File | Role |
 |---|---|
-| `background.js` | MV3 service worker. All DB operations, Chrome event listeners, message handler. |
-| `tree.js` | Sidebar UI logic. Sends messages to background, renders tree, handles drag/drop, SQL panel. |
-| `index.html` | Sidebar shell — all CSS lives here. |
+| `background.js` | MV3 service worker entry point. Uses `importScripts` to load `js/bg-*.js`, then defines `handleMessage` and the `chrome.runtime.onMessage` listener. |
+| `tree.js` | Sidebar ES module entry point. Imports all `js/*.js` modules and runs the boot sequence (load, loadQuickQueries, loadTheme). |
+| `index.html` | Sidebar shell — all CSS lives here. Loads `tree.js` as `type="module"`. |
 | `manifest.json` | Extension manifest. Permissions: `tabs`, `windows`, `storage`, `unlimitedStorage`, `clipboardWrite`. |
 | `sql-wasm.js` / `sql-wasm.wasm` | sql.js library — SQLite compiled to WASM. |
+| `js/bg-db.js` | DB init, schema (`applySchema`), persistence, SQL helpers, `upsertNode`, search parsing. |
+| `js/bg-rules.js` | `executeActionRule` — runs a single action rule against the DB. |
+| `js/bg-sync.js` | Chrome event handlers (`onTab*`, `onWindow*`), `resync`, `initialize`, `updateBadge`. |
+| `js/bg-popup.js` | `openOrFocusPopup`, `onBoundsChanged` (saves popup geometry to config), toolbar/command listeners. |
+| `js/state.js` | Exports a single `state` object holding all shared mutable UI state. |
+| `js/db-api.js` | Exports `db` — the sidebar-side message wrapper (`db.send`, `db.query`, etc.). |
+| `js/helpers.js` | Pure helpers: `escHtml`, `nodeIcon`, `nodeLabel`, `parseSearchTerms`, `matchesSearch`, `childrenOf`, `allDescendantIds`, `recomputeDupUrls`, `setStatus`. |
+| `js/focus.js` | `syncFocusState`, `applyFocusHighlights`. |
+| `js/render.js` | `buildTree`, `render`, `load`, `loadTags`. |
+| `js/events.js` | All DOM event listeners: tree clicks, action buttons, context menu, drag/drop, search, toolbar, live Chrome events, config section expand/collapse. |
+| `js/sql-panel.js` | SQL panel: `loadQuickQueries`, `runSQL`, save/delete/restore query buttons, resize handle, schema popup. |
+| `js/config.js` | `loadTheme`, `buildColorGrid`, color reset, import/export (TabOutliner + SQL). |
+| `js/tags.js` | Tag picker overlay, `loadCfgTags`, config tags panel, `btn-tag-search` handler. |
+| `js/actions-cfg.js` | `loadCfgActions`, `showActionEditor`, config actions panel. |
 
 ## DB schema
 
@@ -73,6 +87,17 @@ tag_id   INTEGER NOT NULL
 PRIMARY KEY (node_id, tag_id)
 ```
 
+### `config` table
+Key/value store for persistent settings. Written by `set_config`, read by `get_config`.
+```
+key   TEXT PRIMARY KEY
+value TEXT
+```
+
+Used keys:
+- `color_--<css-prop>` — one entry per CSS custom property (e.g. `color_--bg`, `color_--accent`). Written on any color change; read at load to restore the theme.
+- `popup_width`, `popup_height`, `popup_left`, `popup_top` — popup window geometry, updated by `chrome.windows.onBoundsChanged`, applied when opening a new popup.
+
 ### `win_auto_tag` table
 When a tag is registered here for a window node, `onTabCreated` automatically inserts into `node_tag` for every new tab opened in that window.
 ```
@@ -107,6 +132,12 @@ created_at     TEXT
 | `group` | User-defined folder |
 | `textnote` | Freeform text note |
 | `separatorline` | Visual divider |
+
+## Module structure
+
+`background.js` is a classic MV3 service worker that uses `importScripts` to load four sub-files from `js/`. All sub-files share the same global scope — no exports needed. `handleMessage` (the big switch) and the `onMessage` listener live in `background.js` itself.
+
+`tree.js` is an ES module entry point. It imports all sidebar sub-modules (which register their own event listeners as side effects on import) then runs the boot sequence. Shared mutable state lives in `js/state.js` as a single exported `state` object; all modules import and mutate it directly.
 
 ## background.js patterns
 
@@ -184,10 +215,18 @@ All messages: `{ to: 'background', cmd, payload }` → response `{ ok, data }` o
 | `run_action_rule` | `{ id }` | `{ affected }` |
 | `run_auto_actions` | — | `{ total }` — runs all is_auto=1 rules |
 | `get_schema` | — | `{ schema }` — object keyed by table/view name, values are PRAGMA table_info rows |
+| `get_config` | `{ key? }` | `{ value }` if key given; `{ values: {key→val} }` for all entries |
+| `set_config` | `{ key, value }` or `{ entries: {key→val} }` | — |
 
 ## Search term parser
 
 `parseSearchTerms(q)` in both `background.js` and `tree.js` splits a query into `[{field, value}]`. Field is null for bare terms. `buildSearchWhere(terms)` (background only) returns `{ where, params }` for a parameterized SQL WHERE clause. Supported field prefixes: `title`, `url`, `domain`, `note`, `label`, `tag`.
+
+### updateBadge
+Called after every tab/window create/remove event and on boot. Queries the open tab count and sets `chrome.action.setBadgeText`.
+
+### Popup geometry persistence
+`chrome.windows.onBoundsChanged` fires whenever the popup is moved or resized. If the changed window matches `popupWinId` in session storage, the new `width/height/left/top` values are written to the `config` table. `openOrFocusPopup` reads those four keys before calling `chrome.windows.create`.
 
 ## tree.js key patterns
 
