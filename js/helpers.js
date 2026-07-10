@@ -1,4 +1,6 @@
 import { state } from './state.js';
+import { parseSearchTerms } from './common.js';
+export { parseSearchTerms };
 
 export function escHtml(s) {
   return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -22,17 +24,6 @@ export function nodeIcon(n) {
 
 export function nodeLabel(n) {
   return n.custom_title || n.title || n.url || n.note_text || `[${n.node_type}]`;
-}
-
-export function parseSearchTerms(q) {
-  const terms = [];
-  const re = /(\w+):(\S+)|(\S+)/g;
-  let m;
-  while ((m = re.exec(q)) !== null) {
-    if (m[1]) terms.push({ field: m[1].toLowerCase(), value: m[2].toLowerCase() });
-    else      terms.push({ field: null,                value: m[3].toLowerCase() });
-  }
-  return terms;
 }
 
 export function highlightText(text, q) {

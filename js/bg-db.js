@@ -1,6 +1,6 @@
-const DB_KEY = 'tabsql_db_v1';
+import { initSqlJs } from '../sql-wasm.js';
 
-const DEFAULT_QUICK_QUERIES = [
+export const DEFAULT_QUICK_QUERIES = [
   { label: 'Node counts',    sql: `SELECT node_type, COUNT(*) c FROM node GROUP BY node_type ORDER BY c DESC` },
   { label: 'Open tabs',      sql: `SELECT * FROM node WHERE is_open=1 AND node_type='tab' ORDER BY position` },
   { label: 'Saved tabs',     sql: `SELECT * FROM node WHERE node_type='tab' AND is_saved=1 ORDER BY updated_at DESC LIMIT 100` },
@@ -11,33 +11,115 @@ const DEFAULT_QUICK_QUERIES = [
   { label: 'All notes',      sql: `SELECT * FROM node WHERE note_text IS NOT NULL ORDER BY updated_at DESC` },
 ];
 
-let SQL         = null;
-let db          = null;
-let dbReady     = null;
-let pendingAdopt  = null;
-let adoptedTabIds = new Set();
+// Shared mutable state accessed by both bg-db.js internals and bg-sync.js / background.js
+export const bgState = {
+  pendingAdopt:  null,
+  adoptedTabIds: new Set(),
+};
+
+let SQL     = null;
+let db      = null;
+let dbReady = null;
 
 async function _initDb() {
   SQL = await initSqlJs({ locateFile: () => chrome.runtime.getURL('sql-wasm.wasm') });
-  const stored = await chrome.storage.local.get(DB_KEY);
-  if (stored[DB_KEY]) {
-    db = new SQL.Database(new Uint8Array(stored[DB_KEY]));
+  const stored = await chrome.storage.local.get('tabsql_db_v1');
+  if (stored['tabsql_db_v1']) {
+    db = new SQL.Database(new Uint8Array(stored['tabsql_db_v1']));
   } else {
     db = new SQL.Database();
   }
   applySchema();
 }
 
-async function ensureDb() {
+export async function ensureDb() {
   if (db) return;
   if (!dbReady) dbReady = _initDb();
   await dbReady;
 }
 
-async function persistDb() {
+export async function persistDb() {
   if (!db) return;
   const data = db.export();
-  await chrome.storage.local.set({ [DB_KEY]: Array.from(data) });
+  await chrome.storage.local.set({ tabsql_db_v1: Array.from(data) });
+}
+
+export function sqlQuery(sql, params = []) {
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  const rows = [];
+  while (stmt.step()) rows.push(stmt.getAsObject());
+  stmt.free();
+  return rows;
+}
+
+export function sqlRun(sql, params = []) {
+  const stmt = db.prepare(sql);
+  stmt.run(params);
+  stmt.free();
+}
+
+export function sqlInsert(sql, params = []) {
+  sqlRun(sql, params);
+  return db.exec('SELECT last_insert_rowid()')[0].values[0][0];
+}
+
+export function sqlExec(sql) {
+  db.exec(sql);
+}
+
+function extractDomain(url) {
+  if (!url) return null;
+  try { return new URL(url).hostname || null; } catch { return null; }
+}
+
+export function buildSearchWhere(terms) {
+  const clauses = [], params = [];
+  for (const t of terms) {
+    const like = `%${t.value}%`;
+    if (!t.field) {
+      clauses.push('(title LIKE ? OR url LIKE ? OR note_text LIKE ? OR custom_title LIKE ?)');
+      params.push(like, like, like, like);
+    } else if (t.field === 'title') {
+      clauses.push('title LIKE ?'); params.push(like);
+    } else if (t.field === 'url') {
+      clauses.push('url LIKE ?'); params.push(like);
+    } else if (t.field === 'domain') {
+      clauses.push('domain LIKE ?'); params.push(like);
+    } else if (t.field === 'note') {
+      clauses.push('note_text LIKE ?'); params.push(like);
+    } else if (t.field === 'label') {
+      clauses.push('(COALESCE(custom_title, title, url, note_text) LIKE ?)'); params.push(like);
+    } else if (t.field === 'tag') {
+      clauses.push('id IN (SELECT nt.node_id FROM node_tag nt JOIN tag t2 ON t2.id=nt.tag_id WHERE t2.name LIKE ?)');
+      params.push(like);
+    } else {
+      clauses.push('(title LIKE ? OR url LIKE ? OR note_text LIKE ? OR custom_title LIKE ?)');
+      params.push(like, like, like, like);
+    }
+  }
+  return { where: clauses.length ? clauses.join(' AND ') : '1=1', params };
+}
+
+export function upsertNode(node) {
+  if ('url' in node && !('domain' in node)) {
+    node = { ...node, domain: extractDomain(node.url) };
+  }
+  const cols = Object.keys(node).filter(k => k !== 'id');
+  if ('id' in node) {
+    const set = cols.map(c => `${c} = ?`).join(', ');
+    sqlRun(
+      `UPDATE node SET ${set}, updated_at=datetime('now') WHERE id=?`,
+      [...cols.map(c => node[c] ?? null), node.id]
+    );
+    return node.id;
+  }
+  const colNames = cols.join(', ');
+  const placeholders = cols.map(() => '?').join(', ');
+  return sqlInsert(
+    `INSERT INTO node (${colNames}) VALUES (${placeholders})`,
+    cols.map(c => node[c] ?? null)
+  );
 }
 
 function applySchema() {
@@ -139,96 +221,11 @@ function applySchema() {
   if (+count === 0) seedDefaultQueries();
 }
 
-function seedDefaultQueries() {
+export function seedDefaultQueries() {
   DEFAULT_QUICK_QUERIES.forEach((q, i) => {
     sqlInsert(
       'INSERT INTO quick_query (label, sql, position, is_default) VALUES (?,?,?,1)',
       [q.label, q.sql, i]
     );
   });
-}
-
-function sqlQuery(sql, params = []) {
-  const stmt = db.prepare(sql);
-  stmt.bind(params);
-  const rows = [];
-  while (stmt.step()) rows.push(stmt.getAsObject());
-  stmt.free();
-  return rows;
-}
-
-function sqlRun(sql, params = []) {
-  const stmt = db.prepare(sql);
-  stmt.run(params);
-  stmt.free();
-}
-
-function sqlInsert(sql, params = []) {
-  sqlRun(sql, params);
-  return db.exec('SELECT last_insert_rowid()')[0].values[0][0];
-}
-
-function extractDomain(url) {
-  if (!url) return null;
-  try { return new URL(url).hostname || null; } catch { return null; }
-}
-
-function parseSearchTerms(q) {
-  const terms = [];
-  const re = /(\w+):(\S+)|(\S+)/g;
-  let m;
-  while ((m = re.exec(q)) !== null) {
-    if (m[1]) terms.push({ field: m[1].toLowerCase(), value: m[2].toLowerCase() });
-    else      terms.push({ field: null,                value: m[3].toLowerCase() });
-  }
-  return terms;
-}
-
-function buildSearchWhere(terms) {
-  const clauses = [], params = [];
-  for (const t of terms) {
-    const like = `%${t.value}%`;
-    if (!t.field) {
-      clauses.push('(title LIKE ? OR url LIKE ? OR note_text LIKE ? OR custom_title LIKE ?)');
-      params.push(like, like, like, like);
-    } else if (t.field === 'title') {
-      clauses.push('title LIKE ?'); params.push(like);
-    } else if (t.field === 'url') {
-      clauses.push('url LIKE ?'); params.push(like);
-    } else if (t.field === 'domain') {
-      clauses.push('domain LIKE ?'); params.push(like);
-    } else if (t.field === 'note') {
-      clauses.push('note_text LIKE ?'); params.push(like);
-    } else if (t.field === 'label') {
-      clauses.push('(COALESCE(custom_title, title, url, note_text) LIKE ?)'); params.push(like);
-    } else if (t.field === 'tag') {
-      clauses.push('id IN (SELECT nt.node_id FROM node_tag nt JOIN tag t2 ON t2.id=nt.tag_id WHERE t2.name LIKE ?)');
-      params.push(like);
-    } else {
-      clauses.push('(title LIKE ? OR url LIKE ? OR note_text LIKE ? OR custom_title LIKE ?)');
-      params.push(like, like, like, like);
-    }
-  }
-  return { where: clauses.length ? clauses.join(' AND ') : '1=1', params };
-}
-
-function upsertNode(node) {
-  if ('url' in node && !('domain' in node)) {
-    node = { ...node, domain: extractDomain(node.url) };
-  }
-  const cols = Object.keys(node).filter(k => k !== 'id');
-  if ('id' in node) {
-    const set = cols.map(c => `${c} = ?`).join(', ');
-    sqlRun(
-      `UPDATE node SET ${set}, updated_at=datetime('now') WHERE id=?`,
-      [...cols.map(c => node[c] ?? null), node.id]
-    );
-    return node.id;
-  }
-  const colNames = cols.join(', ');
-  const placeholders = cols.map(() => '?').join(', ');
-  return sqlInsert(
-    `INSERT INTO node (${colNames}) VALUES (${placeholders})`,
-    cols.map(c => node[c] ?? null)
-  );
 }

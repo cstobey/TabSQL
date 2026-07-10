@@ -1,3 +1,5 @@
+import { ensureDb, persistDb, sqlQuery, sqlRun } from './bg-db.js';
+
 async function openOrFocusPopup() {
   const { popupWinId } = await chrome.storage.session.get('popupWinId');
   if (popupWinId != null) {

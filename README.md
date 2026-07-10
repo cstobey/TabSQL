@@ -27,20 +27,21 @@ A Chrome extension that manages browser tabs in a persistent tree view, backed b
 
 ```
 TabSQL/
-  manifest.json        Chrome extension manifest (MV3)
-  background.js        Service worker entry point — imports js/bg-*.js, handles messages
+  manifest.json        Chrome extension manifest (MV3, background type "module")
+  background.js        Service worker entry point (ES module) — imports js/bg-*.js, handles messages
   index.html           Sidebar UI shell and all CSS
   tree.js              Sidebar UI entry point (ES module) — imports js/*.js and boots
-  sql-wasm.js          sql.js library
+  sql-wasm.js          sql.js library (exports initSqlJs)
   sql-wasm.wasm        SQLite compiled to WASM
   js/
-    bg-db.js           DB init, schema, persistence, SQL helpers, node upsert
+    common.js          Shared pure logic (no DOM/Chrome/SQL): parseSearchTerms
+    bg-db.js           DB init, schema, persistence, SQL helpers, node upsert, buildSearchWhere
     bg-rules.js        Action rule execution
     bg-sync.js         Chrome tab/window sync, event handlers, badge updates
     bg-popup.js        Popup open/focus/resize lifecycle
     state.js           Shared mutable state (allNodes, nodeMap, tags, …)
     db-api.js          Sidebar→background message wrapper (db.send / db.query)
-    helpers.js         Pure helpers: escHtml, parseSearchTerms, nodeIcon, …
+    helpers.js         Pure helpers: escHtml, parseSearchTerms (from common.js), matchesTerm, nodeIcon, …
     focus.js           Focus state sync and highlight application
     render.js          Tree build/render, load(), loadTags()
     events.js          All DOM event listeners (click, drag, search, toolbar)

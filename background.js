@@ -1,7 +1,11 @@
-'use strict';
-
-importScripts('sql-wasm.js');
-importScripts('js/bg-db.js', 'js/bg-rules.js', 'js/bg-sync.js', 'js/bg-popup.js');
+import { parseSearchTerms } from './js/common.js';
+import {
+  ensureDb, persistDb, sqlQuery, sqlRun, sqlInsert, sqlExec, upsertNode,
+  buildSearchWhere, DEFAULT_QUICK_QUERIES, bgState,
+} from './js/bg-db.js';
+import { executeActionRule } from './js/bg-rules.js';
+import { initialize, resync } from './js/bg-sync.js';
+import './js/bg-popup.js';
 
 // ---------------------------------------------------------------------------
 // Message handler
@@ -78,7 +82,7 @@ async function handleMessage(cmd, payload) {
     }
 
     case 'pre_open_tab':
-      pendingAdopt = { nodeId: payload.nodeId, url: payload.url, ts: Date.now() };
+      bgState.pendingAdopt = { nodeId: payload.nodeId, url: payload.url, ts: Date.now() };
       return { ok: true };
 
     case 'open_saved_window': {
@@ -92,7 +96,7 @@ async function handleMessage(cmd, payload) {
       const chromeTabs = newWin.tabs ?? [];
       for (let i = 0; i < Math.min(savedTabs.length, chromeTabs.length); i++) {
         upsertNode({ id: savedTabs[i].id, chrome_id: chromeTabs[i].id, is_open: 1, is_saved: 0, node_type: 'tab', position: i });
-        adoptedTabIds.add(chromeTabs[i].id);
+        bgState.adoptedTabIds.add(chromeTabs[i].id);
       }
       await persistDb();
       return { ok: true };
@@ -138,7 +142,7 @@ async function handleMessage(cmd, payload) {
       return { ok: true };
 
     case 'exec_raw': {
-      db.exec(payload.sql);
+      sqlExec(payload.sql);
       await persistDb();
       return { ok: true };
     }
@@ -306,7 +310,7 @@ async function handleMessage(cmd, payload) {
         }
       } else {
         newWin = await chrome.windows.create({ url: savedTabs[0].url });
-        adoptedTabIds.add(newWin.tabs[0].id);
+        bgState.adoptedTabIds.add(newWin.tabs[0].id);
       }
 
       let winNodeId = sqlQuery(`SELECT id FROM node WHERE chrome_id=? AND node_type='win' LIMIT 1`, [newWin.id])[0]?.id;
@@ -326,13 +330,13 @@ async function handleMessage(cmd, payload) {
         upsertNode({ id: savedTabs[0].id, chrome_id: newWin.tabs[0].id, is_open: 1, is_saved: 0, parent_id: winNodeId, position: pos++ });
         for (let i = 1; i < savedTabs.length; i++) {
           const newTab = await chrome.tabs.create({ windowId: newWin.id, url: savedTabs[i].url, active: false });
-          adoptedTabIds.add(newTab.id);
+          bgState.adoptedTabIds.add(newTab.id);
           upsertNode({ id: savedTabs[i].id, chrome_id: newTab.id, is_open: 1, is_saved: 0, parent_id: winNodeId, position: pos++ });
         }
       } else {
         for (const t of savedTabs) {
           const newTab = await chrome.tabs.create({ windowId: newWin.id, url: t.url, active: false });
-          adoptedTabIds.add(newTab.id);
+          bgState.adoptedTabIds.add(newTab.id);
           upsertNode({ id: t.id, chrome_id: newTab.id, is_open: 1, is_saved: 0, parent_id: winNodeId, position: pos++ });
         }
       }

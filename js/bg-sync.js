@@ -1,3 +1,6 @@
+import { parseSearchTerms } from './common.js';
+import { ensureDb, persistDb, sqlQuery, sqlRun, upsertNode, buildSearchWhere, bgState } from './bg-db.js';
+
 async function upsertWin(chromeWin) {
   await ensureDb();
   const existing = sqlQuery(
@@ -62,7 +65,7 @@ async function tabDbId(chromeTabId) {
   return rows[0]?.id ?? null;
 }
 
-async function resync() {
+export async function resync() {
   await ensureDb();
   const wins = await chrome.windows.getAll({ populate: true });
 
@@ -134,7 +137,7 @@ async function resync() {
   await persistDb();
 }
 
-async function initialize() {
+export async function initialize() {
   await resync();
   await updateBadge();
   console.log('TabSQL initialized');
@@ -161,8 +164,8 @@ function deleteOpenDescendants(nodeId, newParentId) {
   }
 }
 
-async function updateBadge() {
-  if (!db) return;
+export async function updateBadge() {
+  await ensureDb();
   const rows = sqlQuery(`SELECT COUNT(*) c FROM node WHERE node_type='tab' AND is_open=1`);
   const count = rows[0]?.c ?? 0;
   chrome.action.setBadgeBackgroundColor({ color: '#7c9ef8' });
@@ -191,14 +194,14 @@ async function onWindowRemoved(winId) {
 }
 
 async function onTabCreated(tab) {
-  if (adoptedTabIds.has(tab.id)) {
-    adoptedTabIds.delete(tab.id);
+  if (bgState.adoptedTabIds.has(tab.id)) {
+    bgState.adoptedTabIds.delete(tab.id);
     return;
   }
 
-  if (pendingAdopt && (Date.now() - pendingAdopt.ts < 5000)) {
-    const { nodeId } = pendingAdopt;
-    pendingAdopt = null;
+  if (bgState.pendingAdopt && (Date.now() - bgState.pendingAdopt.ts < 5000)) {
+    const { nodeId } = bgState.pendingAdopt;
+    bgState.pendingAdopt = null;
     const savedPos = sqlQuery('SELECT position FROM node WHERE id=?', [nodeId])[0]?.position ?? -1;
     const pid = await winDbId(tab.windowId);
     upsertNode({

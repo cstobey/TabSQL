@@ -1,4 +1,7 @@
-async function executeActionRule(rule) {
+import { parseSearchTerms } from './common.js';
+import { buildSearchWhere, sqlQuery, sqlRun, upsertNode, persistDb } from './bg-db.js';
+
+export async function executeActionRule(rule) {
   let nodes = [];
   if (rule.condition_type === 'search') {
     const terms = parseSearchTerms((rule.condition ?? '').toLowerCase());

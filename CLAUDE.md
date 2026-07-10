@@ -8,18 +8,19 @@ Chrome extension (Manifest V3) that manages browser tabs in a persistent tree vi
 
 | File | Role |
 |---|---|
-| `background.js` | MV3 service worker entry point. Uses `importScripts` to load `js/bg-*.js`, then defines `handleMessage` and the `chrome.runtime.onMessage` listener. |
+| `background.js` | MV3 service worker entry point (ES module). Imports `js/bg-*.js` and `js/common.js`, defines `handleMessage` and the `chrome.runtime.onMessage` listener. |
 | `tree.js` | Sidebar ES module entry point. Imports all `js/*.js` modules and runs the boot sequence (load, loadQuickQueries, loadTheme). |
 | `index.html` | Sidebar shell — all CSS lives here. Loads `tree.js` as `type="module"`. |
-| `manifest.json` | Extension manifest. Permissions: `tabs`, `windows`, `storage`, `unlimitedStorage`, `clipboardWrite`. |
-| `sql-wasm.js` / `sql-wasm.wasm` | sql.js library — SQLite compiled to WASM. |
-| `js/bg-db.js` | DB init, schema (`applySchema`), persistence, SQL helpers, `upsertNode`, search parsing. |
+| `manifest.json` | Extension manifest. Background type `"module"`. Permissions: `tabs`, `windows`, `storage`, `unlimitedStorage`, `clipboardWrite`. |
+| `sql-wasm.js` / `sql-wasm.wasm` | sql.js library — SQLite compiled to WASM. Exports `initSqlJs`. |
+| `js/common.js` | Shared pure logic used by both the service worker and the sidebar: `parseSearchTerms`. No DOM, Chrome API, or SQL dependencies. |
+| `js/bg-db.js` | DB init, schema (`applySchema`), persistence, SQL helpers (`sqlQuery`, `sqlRun`, `sqlInsert`, `sqlExec`), `upsertNode`, `buildSearchWhere`, `bgState`. |
 | `js/bg-rules.js` | `executeActionRule` — runs a single action rule against the DB. |
 | `js/bg-sync.js` | Chrome event handlers (`onTab*`, `onWindow*`), `resync`, `initialize`, `updateBadge`. |
 | `js/bg-popup.js` | `openOrFocusPopup`, `onBoundsChanged` (saves popup geometry to config), toolbar/command listeners. |
 | `js/state.js` | Exports a single `state` object holding all shared mutable UI state. |
 | `js/db-api.js` | Exports `db` — the sidebar-side message wrapper (`db.send`, `db.query`, etc.). |
-| `js/helpers.js` | Pure helpers: `escHtml`, `nodeIcon`, `nodeLabel`, `parseSearchTerms`, `matchesSearch`, `childrenOf`, `allDescendantIds`, `recomputeDupUrls`, `setStatus`. |
+| `js/helpers.js` | Pure helpers: `escHtml`, `nodeIcon`, `nodeLabel`, `parseSearchTerms` (re-exported from `common.js`), `matchesSearch`, `matchesTerm`, `childrenOf`, `allDescendantIds`, `recomputeDupUrls`, `setStatus`. |
 | `js/focus.js` | `syncFocusState`, `applyFocusHighlights`. |
 | `js/render.js` | `buildTree`, `render`, `load`, `loadTags`. |
 | `js/events.js` | All DOM event listeners: tree clicks, action buttons, context menu, drag/drop, search, toolbar, live Chrome events, config section expand/collapse. |
@@ -135,9 +136,15 @@ created_at     TEXT
 
 ## Module structure
 
-`background.js` is a classic MV3 service worker that uses `importScripts` to load four sub-files from `js/`. All sub-files share the same global scope — no exports needed. `handleMessage` (the big switch) and the `onMessage` listener live in `background.js` itself.
+`background.js` is an ES module MV3 service worker (`"type": "module"` in manifest). It imports from `js/bg-*.js` and `js/common.js`. Each `bg-*.js` file exports the functions it provides; event listeners in `bg-sync.js` and `bg-popup.js` register as side effects of import. `handleMessage` (the big switch) and the `onMessage` listener live in `background.js` itself.
+
+Shared mutable service-worker state (`pendingAdopt`, `adoptedTabIds`) lives in `bgState` exported from `js/bg-db.js` and imported by `bg-sync.js` and `background.js`.
 
 `tree.js` is an ES module entry point. It imports all sidebar sub-modules (which register their own event listeners as side effects on import) then runs the boot sequence. Shared mutable state lives in `js/state.js` as a single exported `state` object; all modules import and mutate it directly.
+
+### Search term parsing — shared vs. parallel implementations
+
+`js/common.js` holds `parseSearchTerms(q)`, which is used by both sides. The SQL translation (`buildSearchWhere` in `bg-db.js`) and the in-memory JS matching (`matchesTerm` in `helpers.js`) are intentionally separate: they implement the same field set but in fundamentally different ways (SQL LIKE clauses vs. `String.includes`). Add new fields to both functions when extending search.
 
 ## background.js patterns
 
