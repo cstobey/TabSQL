@@ -3,11 +3,11 @@
 
 export function parseSearchTerms(q) {
   const terms = [];
-  const re = /(\w+):(\S+)|(\S+)/g;
+  const re = /(\w+):(\S+)|(\S+)/gi;
   let m;
-  while ((m = re.exec(q)) !== null) {
-    if (m[1]) terms.push({ field: m[1].toLowerCase(), value: m[2].toLowerCase() });
-    else      terms.push({ field: null,                value: m[3].toLowerCase() });
+  while ((m = re.exec((q ?? ''))) !== null) {
+    if (m[1]) terms.push({ field: m[1], value: m[2] });
+    else      terms.push({ field: null, value: m[3] });
   }
   return terms;
 }

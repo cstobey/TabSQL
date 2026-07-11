@@ -1,6 +1,6 @@
 import { state } from './state.js';
 import { db } from './db-api.js';
-import { escHtml, setStatus, nodeIcon, nodeLabel, highlightText, matchesSearch, childrenOf, recomputeDupUrls } from './helpers.js';
+import { escHtml, setStatus, nodeIcon, nodeLabel, highlightText, childrenOf, recomputeDupUrls } from './helpers.js';
 import { syncFocusState, applyFocusHighlights } from './focus.js';
 
 export async function load() {
@@ -118,34 +118,24 @@ export function buildTree(parentId = null, depth = 0, searchOpts = null) {
   }).join('');
 }
 
-export function render(nodes, filter = '') {
+export async function render(nodes, filter = '') {
   const treeEl = document.getElementById('tree');
   const searchWinBtn   = document.getElementById('btn-search-window');
   const tagSearchBtn   = document.getElementById('btn-tag-search');
   const saveSearchBtn  = document.getElementById('btn-save-search');
   const closeSearchBtn = document.getElementById('btn-close-search');
   if (filter) {
-    const q = filter.toLowerCase();
-
-    const matchedIds = new Set(state.allNodes.filter(n => matchesSearch(n, q)).map(n => n.id));
-
-    const visibleIds = new Set(matchedIds);
-    for (const id of matchedIds) {
-      let cur = state.nodeMap[id];
-      while (cur?.parent_id != null) {
-        if (visibleIds.has(cur.parent_id)) break;
-        visibleIds.add(cur.parent_id);
-        cur = state.nodeMap[cur.parent_id];
-      }
-    }
+    const r = await db.send('search', { q: filter });
+    const matchedCount = r?.matchedCount ?? 0;
+    const visibleIds = new Set(r?.visibleIds ?? []);
 
     const session = state.allNodes.find(n => n.node_type === 'session');
-    treeEl.innerHTML = buildTree(session ? session.id : null, 0, { visibleIds, q });
-    setStatus(`${matchedIds.size} result${matchedIds.size !== 1 ? 's' : ''}`);
-    searchWinBtn.style.display   = matchedIds.size ? '' : 'none';
-    tagSearchBtn.style.display   = matchedIds.size ? '' : 'none';
-    saveSearchBtn.style.display  = matchedIds.size ? '' : 'none';
-    closeSearchBtn.style.display = matchedIds.size ? '' : 'none';
+    treeEl.innerHTML = buildTree(session ? session.id : null, 0, { visibleIds, q: filter });
+    setStatus(`${matchedCount} result${matchedCount !== 1 ? 's' : ''}`);
+    searchWinBtn.style.display   = matchedCount ? '' : 'none';
+    tagSearchBtn.style.display   = matchedCount ? '' : 'none';
+    saveSearchBtn.style.display  = matchedCount ? '' : 'none';
+    closeSearchBtn.style.display = matchedCount ? '' : 'none';
     applyFocusHighlights();
     return;
   }

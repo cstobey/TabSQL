@@ -1,4 +1,3 @@
-import { parseSearchTerms } from './common.js';
 import { ensureDb, persistDb, sqlQuery, sqlRun, upsertNode, buildSearchWhere, bgState } from './bg-db.js';
 
 async function upsertWin(chromeWin) {
@@ -247,8 +246,7 @@ async function onTabRemoved(tabId, _info) {
   let shouldSave = false;
   for (const rule of saveRules) {
     if (rule.condition_type === 'search') {
-      const terms = parseSearchTerms((rule.condition ?? '').toLowerCase());
-      const { where, params } = buildSearchWhere(terms);
+      const { where, params } = buildSearchWhere(rule.condition);
       const match = sqlQuery(`SELECT id FROM node WHERE id=? AND (${where})`, [row.id, ...params]);
       if (match.length) { shouldSave = true; break; }
     } else if (rule.condition_type === 'sql') {

@@ -21,7 +21,7 @@ treeEl.addEventListener('click', e => {
 
   if (e.target.classList.contains('toggle')) {
     if (state.collapsed.has(id)) state.collapsed.delete(id); else state.collapsed.add(id);
-    render(state.allNodes, document.getElementById('search').value);
+    render(state.allNodes, document.getElementById('search').value).catch(console.error);
     return;
   }
 
@@ -130,7 +130,7 @@ treeEl.addEventListener('click', async e => {
     state.allNodes = state.allNodes.filter(x => !descIds.has(x.id));
     state.nodeMap  = Object.fromEntries(state.allNodes.map(x => [x.id, x]));
     recomputeDupUrls();
-    render(state.allNodes, document.getElementById('search').value);
+    await render(state.allNodes, document.getElementById('search').value);
   }
 });
 
@@ -189,7 +189,7 @@ ctx.addEventListener('click', async e => {
       state.allNodes = state.allNodes.filter(x => !descIds.has(x.id));
       state.nodeMap  = Object.fromEntries(state.allNodes.map(x => [x.id, x]));
       recomputeDupUrls();
-      render(state.allNodes, document.getElementById('search').value);
+      await render(state.allNodes, document.getElementById('search').value);
     }
   }
 });
@@ -276,7 +276,7 @@ treeEl.addEventListener('drop', async e => {
 let searchTimer = null;
 document.getElementById('search').addEventListener('input', e => {
   clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => render(state.allNodes, e.target.value.trim()), 200);
+  searchTimer = setTimeout(() => render(state.allNodes, e.target.value.trim()).catch(console.error), 200);
 });
 
 // ── Toolbar buttons ───────────────────────────────────────────────────────────

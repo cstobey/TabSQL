@@ -1,3 +1,4 @@
+import { parseSearchTerms } from './common.js';
 import { initSqlJs } from '../sql-wasm.js';
 
 export const DEFAULT_QUICK_QUERIES = [
@@ -73,29 +74,26 @@ function extractDomain(url) {
   try { return new URL(url).hostname || null; } catch { return null; }
 }
 
-export function buildSearchWhere(terms) {
+export function buildSearchWhere(q) {
+  const terms = parseSearchTerms(q);
   const clauses = [], params = [];
   for (const t of terms) {
     const like = `%${t.value}%`;
-    if (!t.field) {
-      clauses.push('(title LIKE ? OR url LIKE ? OR note_text LIKE ? OR custom_title LIKE ?)');
-      params.push(like, like, like, like);
-    } else if (t.field === 'title') {
-      clauses.push('title LIKE ?'); params.push(like);
-    } else if (t.field === 'url') {
-      clauses.push('url LIKE ?'); params.push(like);
-    } else if (t.field === 'domain') {
-      clauses.push('domain LIKE ?'); params.push(like);
-    } else if (t.field === 'note') {
-      clauses.push('note_text LIKE ?'); params.push(like);
-    } else if (t.field === 'label') {
-      clauses.push('(COALESCE(custom_title, title, url, note_text) LIKE ?)'); params.push(like);
-    } else if (t.field === 'tag') {
-      clauses.push('id IN (SELECT nt.node_id FROM node_tag nt JOIN tag t2 ON t2.id=nt.tag_id WHERE t2.name LIKE ?)');
-      params.push(like);
-    } else {
-      clauses.push('(title LIKE ? OR url LIKE ? OR note_text LIKE ? OR custom_title LIKE ?)');
-      params.push(like, like, like, like);
+    switch (t.field) {
+      case 'title':
+      case 'url':
+      case 'domain':
+        clauses.push(t.field + ' LIKE ?'); params.push(like); break;
+      case 'note':
+      case 'note_text':
+        clauses.push('note_text LIKE ?'); params.push(like); break;
+      case 'label':
+      case 'tag':
+        clauses.push('id IN (SELECT nt.node_id FROM node_tag nt JOIN tag t2 ON t2.id=nt.tag_id WHERE t2.name LIKE ?)');
+        params.push(like); break;
+      default: 
+        clauses.push('(title LIKE ? OR url LIKE ? OR note_text LIKE ? OR custom_title LIKE ?)');
+        params.push(like, like, like, like);
     }
   }
   return { where: clauses.length ? clauses.join(' AND ') : '1=1', params };

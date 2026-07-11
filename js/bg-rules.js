@@ -1,11 +1,9 @@
-import { parseSearchTerms } from './common.js';
 import { buildSearchWhere, sqlQuery, sqlRun, upsertNode, persistDb } from './bg-db.js';
 
 export async function executeActionRule(rule) {
   let nodes = [];
   if (rule.condition_type === 'search') {
-    const terms = parseSearchTerms((rule.condition ?? '').toLowerCase());
-    const { where, params } = buildSearchWhere(terms);
+    const { where, params } = buildSearchWhere(rule.condition);
     nodes = sqlQuery(`SELECT * FROM node WHERE ${where} LIMIT 1000`, params);
   } else {
     try { nodes = sqlQuery(rule.condition); } catch { return 0; }

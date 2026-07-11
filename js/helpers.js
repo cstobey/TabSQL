@@ -1,6 +1,5 @@
 import { state } from './state.js';
 import { parseSearchTerms } from './common.js';
-export { parseSearchTerms };
 
 export function escHtml(s) {
   return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -36,29 +35,6 @@ export function highlightText(text, q) {
     result = result.replace(re, m => `<mark class="search-hl">${m}</mark>`);
   }
   return result;
-}
-
-export function matchesTerm(n, t) {
-  const v = t.value;
-  const includes = (s) => s && String(s).toLowerCase().includes(v);
-  if (!t.field) {
-    return includes(n.title) || includes(n.url) || includes(n.note_text) || includes(n.custom_title);
-  }
-  if (t.field === 'title')  return includes(n.title);
-  if (t.field === 'url')    return includes(n.url);
-  if (t.field === 'domain') return includes(n.domain);
-  if (t.field === 'note')   return includes(n.note_text);
-  if (t.field === 'label')  return includes(n.custom_title || n.title || n.url || n.note_text);
-  if (t.field === 'tag') {
-    const tags = state.nodeTagsMap[n.id] ?? [];
-    return tags.some(tg => tg.name.toLowerCase().includes(v));
-  }
-  return includes(n.title) || includes(n.url) || includes(n.note_text) || includes(n.custom_title);
-}
-
-export function matchesSearch(n, q) {
-  const terms = parseSearchTerms(q);
-  return terms.every(t => matchesTerm(n, t));
 }
 
 export function childrenOf(parentId) {

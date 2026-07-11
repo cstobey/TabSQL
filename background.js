@@ -1,4 +1,3 @@
-import { parseSearchTerms } from './js/common.js';
 import {
   ensureDb, persistDb, sqlQuery, sqlRun, sqlInsert, sqlExec, upsertNode,
   buildSearchWhere, DEFAULT_QUICK_QUERIES, bgState,
@@ -64,10 +63,19 @@ async function handleMessage(cmd, payload) {
     }
 
     case 'search': {
-      const terms = parseSearchTerms(payload.q.toLowerCase());
-      const { where, params } = buildSearchWhere(terms);
-      const rows = sqlQuery(`SELECT * FROM node WHERE ${where} LIMIT 200`, params);
-      return { ok: true, rows };
+      const { where, params } = buildSearchWhere(payload.q);
+      const rows = sqlQuery(
+        `WITH RECURSIVE visible(id, is_matched) AS (
+           SELECT id, 1 FROM node WHERE ${where}
+           UNION
+           SELECT n.parent_id, 0 FROM node n JOIN visible v ON n.id = v.id WHERE n.parent_id IS NOT NULL
+         )
+         SELECT id, MAX(is_matched) AS is_matched FROM visible GROUP BY id`,
+        params
+      );
+      const matchedCount = rows.filter(r => r.is_matched).length;
+      const visibleIds = rows.map(r => r.id);
+      return { ok: true, matchedCount, visibleIds };
     }
 
     case 'get_node': {
@@ -230,8 +238,7 @@ async function handleMessage(cmd, payload) {
     }
 
     case 'tag_search_results': {
-      const terms = parseSearchTerms((payload.q ?? '').toLowerCase());
-      const { where, params } = buildSearchWhere(terms);
+      const { where, params } = buildSearchWhere(payload.q);
       const matched = sqlQuery(`SELECT id, node_type FROM node WHERE ${where} LIMIT 1000`, params);
       for (const n of matched) {
         sqlRun('INSERT OR IGNORE INTO node_tag (node_id, tag_id) VALUES (?,?)', [n.id, payload.tagId]);
@@ -291,8 +298,7 @@ async function handleMessage(cmd, payload) {
     }
 
     case 'open_search_in_window': {
-      const terms = parseSearchTerms((payload.q ?? '').toLowerCase());
-      const { where, params } = buildSearchWhere(terms);
+      const { where, params } = buildSearchWhere(payload.q);
       const tabs = sqlQuery(
         `SELECT id, url, is_open, chrome_id, is_saved FROM node WHERE (${where}) AND node_type='tab' AND url IS NOT NULL AND id NOT IN (SELECT DISTINCT parent_id FROM node WHERE parent_id IS NOT NULL) LIMIT 50`,
         params
@@ -346,8 +352,7 @@ async function handleMessage(cmd, payload) {
     }
 
     case 'save_close_search': {
-      const terms = parseSearchTerms((payload.q ?? '').toLowerCase());
-      const { where, params } = buildSearchWhere(terms);
+      const { where, params } = buildSearchWhere(payload.q);
       const tabs = sqlQuery(
         `SELECT id, chrome_id, is_open FROM node WHERE (${where}) AND node_type='tab' AND url IS NOT NULL AND id NOT IN (SELECT DISTINCT parent_id FROM node WHERE parent_id IS NOT NULL) LIMIT 200`,
         params
@@ -363,8 +368,7 @@ async function handleMessage(cmd, payload) {
     }
 
     case 'close_search': {
-      const terms = parseSearchTerms((payload.q ?? '').toLowerCase());
-      const { where, params } = buildSearchWhere(terms);
+      const { where, params } = buildSearchWhere(payload.q);
       const tabs = sqlQuery(
         `SELECT id, chrome_id FROM node WHERE (${where}) AND node_type='tab' AND is_open=1 AND url IS NOT NULL AND id NOT IN (SELECT DISTINCT parent_id FROM node WHERE parent_id IS NOT NULL) LIMIT 200`,
         params
