@@ -11,16 +11,16 @@ Chrome extension (Manifest V3) that manages browser tabs in a persistent tree vi
 | `background.js` | MV3 service worker entry point (ES module). Imports `js/bg-*.js` and `js/common.js`, defines `handleMessage` and the `chrome.runtime.onMessage` listener. |
 | `tree.js` | Sidebar ES module entry point. Imports all `js/*.js` modules and runs the boot sequence (load, loadQuickQueries, loadTheme). |
 | `index.html` | Sidebar shell — all CSS lives here. Loads `tree.js` as `type="module"`. |
-| `manifest.json` | Extension manifest. Background type `"module"`. Permissions: `tabs`, `windows`, `storage`, `unlimitedStorage`, `clipboardWrite`. |
+| `manifest.json` | Extension manifest. Background type `"module"`. Permissions: `tabs`, `tabGroups`, `windows`, `storage`, `unlimitedStorage`, `clipboardWrite`. |
 | `sql-wasm.js` / `sql-wasm.wasm` | sql.js library — SQLite compiled to WASM. Exports `initSqlJs`. |
 | `js/common.js` | Shared pure logic used by both the service worker and the sidebar: `parseSearchTerms`. No DOM, Chrome API, or SQL dependencies. |
 | `js/bg-db.js` | DB init, schema (`applySchema`), persistence, SQL helpers (`sqlQuery`, `sqlRun`, `sqlInsert`, `sqlExec`), `upsertNode`, `buildSearchWhere`, `bgState`. |
 | `js/bg-rules.js` | `executeActionRule` — runs a single action rule against the DB. |
-| `js/bg-sync.js` | Chrome event handlers (`onTab*`, `onWindow*`), `resync`, `initialize`, `updateBadge`. |
+| `js/bg-sync.js` | Chrome event handlers (`onTab*`, `onWindow*`, `onTabGroup*`), `resync`, `initialize`, `updateBadge`, `upsertTabGroup`. |
 | `js/bg-popup.js` | `openOrFocusPopup`, `onBoundsChanged` (saves popup geometry to config), toolbar/command listeners. |
 | `js/state.js` | Exports a single `state` object holding all shared mutable UI state. |
 | `js/db-api.js` | Exports `db` — the sidebar-side message wrapper (`db.send`, `db.query`, etc.). |
-| `js/helpers.js` | Pure helpers: `escHtml`, `nodeIcon`, `nodeLabel`, `parseSearchTerms` (re-exported from `common.js`), `matchesSearch`, `matchesTerm`, `childrenOf`, `allDescendantIds`, `recomputeDupUrls`, `setStatus`. |
+| `js/helpers.js` | Pure helpers: `escHtml`, `nodeIcon`, `nodeLabel`, `highlightText`, `childrenOf`, `allDescendantIds`, `recomputeDupUrls`, `setStatus`. |
 | `js/focus.js` | `syncFocusState`, `applyFocusHighlights`. |
 | `js/render.js` | `buildTree`, `render`, `load`, `loadTags`. |
 | `js/events.js` | All DOM event listeners: tree clicks, action buttons, context menu, drag/drop, search, toolbar, live Chrome events, config section expand/collapse. |
@@ -36,20 +36,18 @@ Chrome extension (Manifest V3) that manages browser tabs in a persistent tree vi
 ```
 id            INTEGER PK AUTOINCREMENT
 parent_id     INTEGER → node(id)
-node_type     TEXT  -- 'win' | 'tab' | 'group' | 'textnote' | 'session' | 'separatorline'
+node_type     TEXT  -- 'win' | 'tab' | 'group' | 'textnote' | 'session' | 'split'
 position      INTEGER
 is_collapsed  INTEGER (0/1)
 is_open       INTEGER (0/1)
 is_saved      INTEGER (0/1)  -- 1 = saved/closed (replaces old savedwin/savedtab node_type values)
-chrome_id     INTEGER  -- Chrome window/tab ID; NULL when is_saved=1
+chrome_id     INTEGER  -- Chrome window/tab/tabGroup ID; NULL when is_saved=1; unique per (node_type, chrome_id)
 title         TEXT
 url           TEXT
 domain        TEXT  -- hostname extracted from url, auto-populated by upsertNode
 favicon_url   TEXT
 note_text     TEXT
-custom_title  TEXT
-custom_favicon TEXT
-color_active  TEXT
+color_active  TEXT  -- for group nodes: Chrome tab group color name (e.g. 'blue', 'red')
 color_saved   TEXT
 relicons      TEXT  -- window type: 'normal' | 'popup' | 'devtools'
 win_rect      TEXT  -- "left_top_width_height"
@@ -130,9 +128,9 @@ created_at     TEXT
 | `session` | Root node — single top-level container |
 | `win` | Chrome window — `is_saved=0` when open (`chrome_id` set, `is_open=1`), `is_saved=1` when closed/saved |
 | `tab` | Chrome tab — `is_saved=0` when open (`chrome_id` set, `is_open=1`), `is_saved=1` when saved/closed |
-| `group` | User-defined folder |
+| `group` | Chrome tab group — `chrome_id` = tabGroup.id, parent = win node, children = tab nodes. Also used as user-defined folders when `chrome_id` is NULL. |
 | `textnote` | Freeform text note |
-| `separatorline` | Visual divider |
+| `split` | Visual divider (formerly `separatorline`). Chrome split-view tracking not implemented (no extension API). |
 
 ## Module structure
 
@@ -142,9 +140,9 @@ Shared mutable service-worker state (`pendingAdopt`, `adoptedTabIds`) lives in `
 
 `tree.js` is an ES module entry point. It imports all sidebar sub-modules (which register their own event listeners as side effects on import) then runs the boot sequence. Shared mutable state lives in `js/state.js` as a single exported `state` object; all modules import and mutate it directly.
 
-### Search term parsing — shared vs. parallel implementations
+### Search term parsing
 
-`js/common.js` holds `parseSearchTerms(q)`, which is used by both sides. The SQL translation (`buildSearchWhere` in `bg-db.js`) and the in-memory JS matching (`matchesTerm` in `helpers.js`) are intentionally separate: they implement the same field set but in fundamentally different ways (SQL LIKE clauses vs. `String.includes`). Add new fields to both functions when extending search.
+`js/common.js` holds `parseSearchTerms(q)`, which is used by both sides. `buildSearchWhere` in `bg-db.js` calls `parseSearchTerms` directly and converts the result to parameterized SQL LIKE clauses. `highlightText` in `helpers.js` calls `parseSearchTerms` to highlight bare terms in rendered labels. Add new field prefixes to both `buildSearchWhere` (SQL side) and `highlightText` logic when extending search.
 
 ## background.js patterns
 
@@ -195,7 +193,6 @@ All messages: `{ to: 'background', cmd, payload }` → response `{ ok, data }` o
 | `upsert_node` | `{ node }` | `{ id }` |
 | `delete_node` | `{ id }` | cascade-deletes all descendants + node_tag/win_auto_tag cleanup |
 | `move_node` | `{ id, parent_id, position }` | — |
-| `get_node` | `{ id }` | `{ row }` |
 | `search` | `{ q }` | `{ rows }` — supports field-prefix syntax |
 | `pre_open_tab` | `{ nodeId, url }` | sets pendingAdopt |
 | `open_saved_window` | `{ winNodeId }` | opens all saved tab children in new window, adopts existing nodes |
@@ -227,7 +224,7 @@ All messages: `{ to: 'background', cmd, payload }` → response `{ ok, data }` o
 
 ## Search term parser
 
-`parseSearchTerms(q)` in both `background.js` and `tree.js` splits a query into `[{field, value}]`. Field is null for bare terms. `buildSearchWhere(terms)` (background only) returns `{ where, params }` for a parameterized SQL WHERE clause. Supported field prefixes: `title`, `url`, `domain`, `note`, `label`, `tag`.
+`parseSearchTerms(q)` in `js/common.js` splits a query into `[{field, value}]`. Field is null for bare terms. `buildSearchWhere(q)` in `bg-db.js` calls it and returns `{ where, params }` for a parameterized SQL WHERE clause. Supported field prefixes: `title`, `url`, `domain`, `note`, `label`, `tag`.
 
 ### updateBadge
 Called after every tab/window create/remove event and on boot. Queries the open tab count and sets `chrome.action.setBadgeText`.

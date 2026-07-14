@@ -14,7 +14,7 @@ export function nodeIcon(n) {
     case 'win':          return n.is_saved ? '📁' : (n.relicons === 'popup' ? '🔲' : '🪟');
     case 'tab':          return n.is_saved ? '·' : '⬤';
     case 'textnote':     return '📝';
-    case 'separatorline':return '—';
+    case 'split':        return '—';
     case 'group':        return '▸';
     case 'session':      return '🌳';
     default:             return '·';
@@ -22,7 +22,7 @@ export function nodeIcon(n) {
 }
 
 export function nodeLabel(n) {
-  return n.custom_title || n.title || n.url || n.note_text || `[${n.node_type}]`;
+  return n.title || n.url || n.note_text || `[${n.node_type}]`;
 }
 
 export function highlightText(text, q) {

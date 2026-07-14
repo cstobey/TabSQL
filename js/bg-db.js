@@ -91,9 +91,9 @@ export function buildSearchWhere(q) {
       case 'tag':
         clauses.push('id IN (SELECT nt.node_id FROM node_tag nt JOIN tag t2 ON t2.id=nt.tag_id WHERE t2.name LIKE ?)');
         params.push(like); break;
-      default: 
-        clauses.push('(title LIKE ? OR url LIKE ? OR note_text LIKE ? OR custom_title LIKE ?)');
-        params.push(like, like, like, like);
+      default:
+        clauses.push('(title LIKE ? OR url LIKE ? OR note_text LIKE ?)');
+        params.push(like, like, like);
     }
   }
   return { where: clauses.length ? clauses.join(' AND ') : '1=1', params };
@@ -135,8 +135,6 @@ function applySchema() {
       url            TEXT,
       favicon_url    TEXT,
       note_text      TEXT,
-      custom_title   TEXT,
-      custom_favicon TEXT,
       color_active   TEXT,
       color_saved    TEXT,
       relicons       TEXT,
@@ -152,15 +150,15 @@ function applySchema() {
     CREATE VIEW tab_flat AS
       SELECT n.id, n.node_type, n.title, n.url, n.favicon_url,
              n.is_open, n.is_saved, n.is_collapsed, n.position,
-             n.custom_title, n.color_active, n.color_saved,
+             n.color_active, n.color_saved,
              p.id AS parent_id, p.title AS parent_title, p.node_type AS parent_type,
              n.created_at, n.updated_at
       FROM node n LEFT JOIN node p ON n.parent_id = p.id
       WHERE n.node_type = 'tab';
     CREATE VIEW window_summary AS
       SELECT w.id, w.node_type,
-             COALESCE(w.custom_title, w.title, 'Untitled') AS title,
-             w.is_open, w.is_saved, w.is_collapsed, w.win_rect, w.custom_favicon,
+             COALESCE(w.title, 'Untitled') AS title,
+             w.is_open, w.is_saved, w.is_collapsed, w.win_rect,
              COUNT(t.id) AS tab_count, SUM(t.is_open) AS open_tab_count
       FROM node w
       LEFT JOIN node t ON t.parent_id = w.id AND t.node_type = 'tab'
@@ -206,10 +204,13 @@ function applySchema() {
     );
   `);
   try { db.exec('ALTER TABLE node ADD COLUMN domain TEXT'); } catch {}
-  try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_chrome_uniq ON node (chrome_id)'); } catch {}
   try { db.exec('ALTER TABLE node ADD COLUMN is_saved INTEGER NOT NULL DEFAULT 0'); } catch {}
+  // Per-type unique index so tab group chrome_ids don't collide with tab/win chrome_ids
+  try { db.exec('DROP INDEX IF EXISTS idx_chrome_uniq'); } catch {}
+  try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_chrome_type_uniq ON node (node_type, chrome_id) WHERE chrome_id IS NOT NULL'); } catch {}
   db.exec("UPDATE node SET node_type='tab', is_saved=1 WHERE node_type='savedtab'");
   db.exec("UPDATE node SET node_type='win', is_saved=1 WHERE node_type='savedwin'");
+  db.exec("UPDATE node SET node_type='split' WHERE node_type='separatorline'");
   const needsDomain = sqlQuery('SELECT id, url FROM node WHERE url IS NOT NULL AND (domain IS NULL OR domain = "")');
   for (const n of needsDomain) {
     const d = extractDomain(n.url);

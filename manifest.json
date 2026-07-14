@@ -28,6 +28,7 @@
   },
   "permissions": [
     "tabs",
+    "tabGroups",
     "windows",
     "storage",
     "unlimitedStorage",

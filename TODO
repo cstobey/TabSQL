@@ -1,0 +1,5 @@
+update you interanl understanding of buildSearchWhere since I changed it (it now calls parseSearchTerms directly)
+capture chrome tab groups as node type group and maintain membership so if nodes are moved in and out of the group either in TabSQL or Chrome, it still works. 
+do the same thing for split views in chrome, but reuse the separator node type and rename it to 'split'. we dont need separator otherwise.
+get rid of the custom_title and custom_favicon fields as we don't need them.
+I updated background.js with a bunch of TODO comments labeling unused messages. the resync is particularly interesting as the frontend is directly calling the function rather than sending a message. if the labeled messages should be used by the frontend, then lets use them, otherwise, I want to know why we have them.

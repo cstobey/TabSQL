@@ -13,17 +13,6 @@ import './js/bg-popup.js';
 async function handleMessage(cmd, payload) {
   await ensureDb();
   switch (cmd) {
-    case 'ping':
-      return { ok: true };
-
-    case 'get_tree': {
-      const pid = payload?.parent_id ?? null;
-      const rows = pid === null
-        ? sqlQuery('SELECT * FROM node WHERE parent_id IS NULL ORDER BY position')
-        : sqlQuery('SELECT * FROM node WHERE parent_id=? ORDER BY position', [pid]);
-      return { ok: true, rows };
-    }
-
     case 'upsert_node': {
       const id = upsertNode(payload.node);
       await persistDb();
@@ -76,17 +65,6 @@ async function handleMessage(cmd, payload) {
       const matchedCount = rows.filter(r => r.is_matched).length;
       const visibleIds = rows.map(r => r.id);
       return { ok: true, matchedCount, visibleIds };
-    }
-
-    case 'get_node': {
-      const rows = sqlQuery('SELECT * FROM node WHERE id=?', [payload.id]);
-      return { ok: true, row: rows[0] ?? null };
-    }
-
-    case 'import_nodes': {
-      for (const node of payload.nodes) upsertNode(node);
-      await persistDb();
-      return { ok: true, count: payload.nodes.length };
     }
 
     case 'pre_open_tab':
