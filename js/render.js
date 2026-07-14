@@ -72,7 +72,8 @@ export function buildTree(parentId = null, depth = 0, searchOpts = null) {
     const noteText  = n.note_text || '';
     const noteHtml  = searchOpts ? highlightText(noteText, searchOpts.q) : escHtml(noteText);
     const isDup     = n.url && state.dupUrls.has(n.url);
-    const dupIndicator = isDup ? `<span class="dup-dot" title="Duplicate URL"></span>` : '';
+    const dupIndicator  = isDup       ? `<span class="dup-dot" title="Duplicate URL"></span>` : '';
+    const pinIndicator  = n.is_pinned ? `<span class="pin-indicator" title="Pinned">📌</span>` : '';
 
     const nodeTags = state.nodeTagsMap[n.id] ?? [];
     const tagChipsHtml = nodeTags.length
@@ -87,8 +88,11 @@ export function buildTree(parentId = null, depth = 0, searchOpts = null) {
       : (n.node_type === 'win' && !n.is_saved)
         ? `<button class="act act-save-win" data-id="${n.id}" title="Save &amp; close window">💾</button>`
         : '';
+    const pinBtn  = (n.node_type === 'tab' && n.is_open)
+      ? `<button class="act act-pin" data-id="${n.id}" title="${n.is_pinned ? 'Unpin' : 'Pin'}">📌</button>`
+      : '';
     const delBtn  = `<button class="act act-del" data-id="${n.id}" title="Delete">✕</button>`;
-    const actions = `<span class="actions">${editBtn}${saveBtn}${delBtn}</span>`;
+    const actions = `<span class="actions">${editBtn}${pinBtn}${saveBtn}${delBtn}</span>`;
     const noteRow = `<div class="note-row${noteText ? '' : ' empty'}" data-note-for="${n.id}"
                          style="padding-left:${indent + 20}px">
                       <span class="note-bar">│</span>
@@ -105,6 +109,7 @@ export function buildTree(parentId = null, depth = 0, searchOpts = null) {
                  style="padding-left:${indent + 4}px" title="${escHtml(n.url || '')}">
               ${toggle}
               ${dupIndicator}
+              ${pinIndicator}
               ${faviconHtml || `<span class="icon">${icon}</span>`}
               <span class="label-group">
                 <span class="label ${label ? '' : 'muted'}">${labelHtml}</span>

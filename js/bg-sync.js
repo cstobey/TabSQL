@@ -30,6 +30,7 @@ async function upsertTab(chromeTab, parentDbId) {
     node_type:   'tab',
     is_open:     1,
     is_saved:    0,
+    is_pinned:   chromeTab.pinned ? 1 : 0,
     chrome_id:   chromeTab.id,
     title:       chromeTab.title      ?? '',
     url:         chromeTab.url        ?? '',
@@ -113,7 +114,8 @@ export async function resync() {
       const existingTab = sqlQuery(`SELECT id FROM node WHERE chrome_id=? AND node_type='tab' LIMIT 1`, [tab.id])[0];
       const parentId = (tab.groupId !== -1 ? tabGroupDbId(tab.groupId) : null) ?? wid;
       const tabNode = {
-        node_type: 'tab', is_open: 1, is_saved: 0, chrome_id: tab.id,
+        node_type: 'tab', is_open: 1, is_saved: 0, is_pinned: tab.pinned ? 1 : 0,
+        chrome_id: tab.id,
         title: tab.title ?? '', url: tab.url ?? '', favicon_url: tab.favIconUrl ?? '',
         position: tab.index ?? 0,
         parent_id: parentId,
@@ -307,6 +309,13 @@ async function onTabUpdated(tabId, changeInfo, tab) {
         ? (tabGroupDbId(changeInfo.groupId) ?? await winDbId(tab.windowId))
         : await winDbId(tab.windowId);
       if (newParentId) sqlRun(`UPDATE node SET parent_id=?, updated_at=datetime('now') WHERE id=?`, [newParentId, id]);
+      await persistDb();
+    }
+  }
+  if (changeInfo.pinned !== undefined) {
+    const id = await tabDbId(tabId);
+    if (id != null) {
+      sqlRun(`UPDATE node SET is_pinned=?, updated_at=datetime('now') WHERE id=?`, [changeInfo.pinned ? 1 : 0, id]);
       await persistDb();
     }
   }

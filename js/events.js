@@ -119,6 +119,12 @@ treeEl.addEventListener('click', async e => {
     return;
   }
 
+  if (btn.classList.contains('act-pin')) {
+    await db.send('set_tab_pinned', { nodeId: id, pinned: !n.is_pinned });
+    scheduleRefresh();
+    return;
+  }
+
   if (btn.classList.contains('act-del')) {
     const descIds = allDescendantIds(id);
     if (n.node_type === 'win' && !n.is_saved && n.chrome_id) {

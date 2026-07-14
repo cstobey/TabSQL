@@ -102,6 +102,17 @@ async function handleMessage(cmd, payload) {
       return { ok: true };
     }
 
+    case 'set_tab_pinned': {
+      const { nodeId, pinned } = payload;
+      const row = sqlQuery('SELECT chrome_id FROM node WHERE id=?', [nodeId])[0];
+      if (row?.chrome_id) {
+        await chrome.tabs.update(row.chrome_id, { pinned });
+      }
+      upsertNode({ id: nodeId, is_pinned: pinned ? 1 : 0 });
+      await persistDb();
+      return { ok: true };
+    }
+
     case 'get_quick_queries': {
       const rows = sqlQuery('SELECT * FROM quick_query ORDER BY position, label');
       return { ok: true, rows };

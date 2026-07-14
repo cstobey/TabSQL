@@ -205,6 +205,7 @@ function applySchema() {
   `);
   try { db.exec('ALTER TABLE node ADD COLUMN domain TEXT'); } catch {}
   try { db.exec('ALTER TABLE node ADD COLUMN is_saved INTEGER NOT NULL DEFAULT 0'); } catch {}
+  try { db.exec('ALTER TABLE node ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0'); } catch {}
   // Per-type unique index so tab group chrome_ids don't collide with tab/win chrome_ids
   try { db.exec('DROP INDEX IF EXISTS idx_chrome_uniq'); } catch {}
   try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_chrome_type_uniq ON node (node_type, chrome_id) WHERE chrome_id IS NOT NULL'); } catch {}
