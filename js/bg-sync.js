@@ -250,7 +250,14 @@ async function onTabCreated(tab) {
   let pid = null;
   if (tab.openerTabId) pid = await tabDbId(tab.openerTabId);
   if (pid == null && tab.groupId !== -1) pid = tabGroupDbId(tab.groupId);
-  if (pid == null)     pid = await winDbId(tab.windowId);
+  if (pid == null && tab.index > 0) {
+    const [preceding] = await chrome.tabs.query({ windowId: tab.windowId, index: tab.index - 1 });
+    if (preceding) {
+      const row = sqlQuery(`SELECT parent_id FROM node WHERE node_type='tab' AND chrome_id=? LIMIT 1`, [preceding.id])[0];
+      if (row?.parent_id != null) pid = row.parent_id;
+    }
+  }
+  if (pid == null) pid = await winDbId(tab.windowId);
   const newTabId = await upsertTab(tab, pid);
   const winId = await winDbId(tab.windowId);
   if (winId) {

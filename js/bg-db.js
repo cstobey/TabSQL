@@ -130,9 +130,11 @@ function applySchema() {
       is_collapsed   INTEGER NOT NULL DEFAULT 0,
       is_open        INTEGER NOT NULL DEFAULT 0,
       is_saved       INTEGER NOT NULL DEFAULT 0,
+      is_pinned      INTEGER NOT NULL DEFAULT 0,
       chrome_id      INTEGER DEFAULT NULL,
       title          TEXT,
       url            TEXT,
+      domain         TEXT,
       favicon_url    TEXT,
       note_text      TEXT,
       color_active   TEXT,
@@ -145,6 +147,7 @@ function applySchema() {
     CREATE INDEX IF NOT EXISTS idx_parent ON node (parent_id, position);
     CREATE INDEX IF NOT EXISTS idx_chrome ON node (chrome_id);
     CREATE INDEX IF NOT EXISTS idx_type   ON node (node_type);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_chrome_type_uniq ON node (node_type, chrome_id) WHERE chrome_id IS NOT NULL;
     DROP VIEW IF EXISTS tab_flat;
     DROP VIEW IF EXISTS window_summary;
     CREATE VIEW tab_flat AS
@@ -203,20 +206,6 @@ function applySchema() {
       value TEXT NOT NULL
     );
   `);
-  try { db.exec('ALTER TABLE node ADD COLUMN domain TEXT'); } catch {}
-  try { db.exec('ALTER TABLE node ADD COLUMN is_saved INTEGER NOT NULL DEFAULT 0'); } catch {}
-  try { db.exec('ALTER TABLE node ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0'); } catch {}
-  // Per-type unique index so tab group chrome_ids don't collide with tab/win chrome_ids
-  try { db.exec('DROP INDEX IF EXISTS idx_chrome_uniq'); } catch {}
-  try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_chrome_type_uniq ON node (node_type, chrome_id) WHERE chrome_id IS NOT NULL'); } catch {}
-  db.exec("UPDATE node SET node_type='tab', is_saved=1 WHERE node_type='savedtab'");
-  db.exec("UPDATE node SET node_type='win', is_saved=1 WHERE node_type='savedwin'");
-  db.exec("UPDATE node SET node_type='split' WHERE node_type='separatorline'");
-  const needsDomain = sqlQuery('SELECT id, url FROM node WHERE url IS NOT NULL AND (domain IS NULL OR domain = "")');
-  for (const n of needsDomain) {
-    const d = extractDomain(n.url);
-    if (d) sqlRun('UPDATE node SET domain=? WHERE id=?', [d, n.id]);
-  }
   const count = sqlQuery('SELECT COUNT(*) c FROM quick_query')[0]?.c ?? 0;
   if (+count === 0) seedDefaultQueries();
 }
