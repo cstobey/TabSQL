@@ -1,20 +1,8 @@
 import { ensureDb, persistDb, sqlQuery, sqlRun, sqlInsert, extractDomain, buildSearchWhere, bgState } from './bg-db.js';
 
-
-async function winDbId(chromeWinId) {
-  await ensureDb();
-  return sqlQuery(`SELECT id FROM node WHERE node_type='win' AND chrome_id=? LIMIT 1`, [chromeWinId])[0]?.id ?? null;
+async function nodeDbId(chromeWinId, type) {
+  return sqlQuery(`SELECT id FROM node WHERE chrome_id=? AND node_type=? LIMIT 1`, [chromeWinId, type])[0]?.id ?? null;
 }
-
-async function tabDbId(chromeTabId) {
-  await ensureDb();
-  return sqlQuery(`SELECT id FROM node WHERE node_type='tab' AND chrome_id=? LIMIT 1`, [chromeTabId])[0]?.id ?? null;
-}
-
-function tabGroupDbId(chromeGroupId) {
-  return sqlQuery(`SELECT id FROM node WHERE node_type='group' AND chrome_id=? LIMIT 1`, [chromeGroupId])[0]?.id ?? null;
-}
-
 
 export async function resync() {
   await ensureDb();
@@ -30,12 +18,12 @@ export async function resync() {
 
   // Sync windows
   for (const win of wins) {
-    const existingWin = sqlQuery(`SELECT id FROM node WHERE chrome_id=? AND node_type='win' LIMIT 1`, [win.id])[0];
+    const existingWin = nodeDbId(win.id, 'win')[0];
     const rect    = `${win.left}_${win.top}_${win.width}_${win.height}`;
     const relicons = win.type ?? 'normal';
     if (existingWin) {
       sqlRun(
-        `UPDATE node SET is_open=1, is_saved=0, win_rect=?, relicons=?, updated_at=datetime('now') WHERE id=?`,
+        `UPDATE node SET is_open=1, win_rect=?, relicons=?, updated_at=datetime('now') WHERE id=?`,
         [rect, relicons, existingWin.id]
       );
     } else {
@@ -48,13 +36,13 @@ export async function resync() {
 
   // Sync tab groups (must come before tabs so group nodes exist for parent assignment)
   for (const group of groups) {
-    const winNodeId = sqlQuery(`SELECT id FROM node WHERE node_type='win' AND chrome_id=? LIMIT 1`, [group.windowId])[0]?.id;
+    const winNodeId = nodeDbId(group.windowId, 'win')[0]?.id;
     if (!winNodeId) continue;
-    const existingGroup = sqlQuery(`SELECT id FROM node WHERE node_type='group' AND chrome_id=? LIMIT 1`, [group.id])[0];
+    const existingGroup = nodeDbId(group.id, 'group')[0];
     const gtitle = group.title ?? '', gcolor = group.color ?? null, gcollapsed = group.collapsed ? 1 : 0;
     if (existingGroup) {
       sqlRun(
-        `UPDATE node SET parent_id=?, title=?, color_active=?, is_collapsed=?, is_open=1, is_saved=0, updated_at=datetime('now') WHERE id=?`,
+        `UPDATE node SET parent_id=?, title=?, color_active=?, is_collapsed=?, is_open=1, updated_at=datetime('now') WHERE id=?`,
         [winNodeId, gtitle, gcolor, gcollapsed, existingGroup.id]
       );
     } else {
@@ -67,15 +55,15 @@ export async function resync() {
 
   // Sync tabs — always set parent_id so group membership stays accurate
   for (const win of wins) {
-    const wid = sqlQuery(`SELECT id FROM node WHERE node_type='win' AND chrome_id=? LIMIT 1`, [win.id])[0]?.id;
+    const wid = nodeDbId(win.id, 'win')[0]?.id;
     for (const tab of (win.tabs ?? [])) {
-      const existingTab = sqlQuery(`SELECT id FROM node WHERE chrome_id=? AND node_type='tab' LIMIT 1`, [tab.id])[0];
-      const parentId = (tab.groupId !== -1 ? tabGroupDbId(tab.groupId) : null) ?? wid;
+      const existingTab = nodeDbId(tab.id, 'tab')[0];
+      const parentId = (tab.groupId !== -1 ? nodeDbId(tab.groupId, 'group') : null) ?? wid;
       const url    = tab.url ?? '';
       const pinned = tab.pinned ? 1 : 0;
       if (existingTab) {
         sqlRun(
-          `UPDATE node SET is_open=1, is_saved=0, is_pinned=?, title=?, url=?, domain=?, favicon_url=?, position=?, parent_id=?, updated_at=datetime('now') WHERE id=?`,
+          `UPDATE node SET is_open=1, is_pinned=?, title=?, url=?, domain=?, favicon_url=?, position=?, parent_id=?, updated_at=datetime('now') WHERE id=?`,
           [pinned, tab.title ?? '', url, extractDomain(url), tab.favIconUrl ?? '', tab.index ?? 0, parentId, existingTab.id]
         );
       } else {
@@ -160,12 +148,12 @@ export async function updateBadge() {
 
 async function onWindowCreated(win) {
   await ensureDb();
-  const existing = sqlQuery(`SELECT id FROM node WHERE chrome_id=? AND node_type='win' LIMIT 1`, [win.id])[0];
+  const existing = nodeDbId(win.id, 'win')[0];
   const rect    = `${win.left}_${win.top}_${win.width}_${win.height}`;
   const relicons = win.type ?? 'normal';
   if (existing) {
     sqlRun(
-      `UPDATE node SET is_open=1, is_saved=0, win_rect=?, relicons=?, updated_at=datetime('now') WHERE id=?`,
+      `UPDATE node SET is_open=1, win_rect=?, relicons=?, updated_at=datetime('now') WHERE id=?`,
       [rect, relicons, existing.id]
     );
   } else {
@@ -185,7 +173,7 @@ async function onWindowRemoved(winId) {
     await chrome.storage.session.remove('popupWinId');
     return;
   }
-  const winRow = sqlQuery(`SELECT id FROM node WHERE node_type='win' AND chrome_id=? LIMIT 1`, [winId])[0];
+  const winRow = nodeDbId(winId, 'win')[0];
   if (!winRow) return;
   deleteOpenDescendants(winRow.id, null);
   if (hasSavedDescendants(winRow.id)) {
@@ -198,6 +186,7 @@ async function onWindowRemoved(winId) {
 }
 
 async function onTabCreated(tab) {
+  await ensureDb();
   if (bgState.adoptedTabIds.has(tab.id)) {
     bgState.adoptedTabIds.delete(tab.id);
     return;
@@ -207,10 +196,10 @@ async function onTabCreated(tab) {
     const { nodeId } = bgState.pendingAdopt;
     bgState.pendingAdopt = null;
     const savedPos = sqlQuery('SELECT position FROM node WHERE id=?', [nodeId])[0]?.position ?? -1;
-    const pid = await winDbId(tab.windowId);
+    const pid = await nodeDbId(tab.windowId, 'win'); // TODO: the parent_id might not be the window, it might need to be another tab based on relative position
     const url = tab.url ?? '';
     sqlRun(
-      `UPDATE node SET chrome_id=?, is_open=1, is_saved=0, parent_id=?, title=?, url=?, domain=?, favicon_url=?, position=?, updated_at=datetime('now') WHERE id=?`,
+      `UPDATE node SET chrome_id=?, is_open=1, parent_id=?, title=?, url=?, domain=?, favicon_url=?, position=?, updated_at=datetime('now') WHERE id=?`,
       [tab.id, pid, tab.title ?? '', url, extractDomain(url), tab.favIconUrl ?? '', tab.index ?? 0, nodeId]
     );
     await persistDb();
@@ -221,8 +210,8 @@ async function onTabCreated(tab) {
   }
 
   let pid = null;
-  if (tab.openerTabId) pid = await tabDbId(tab.openerTabId);
-  if (pid == null && tab.groupId !== -1) pid = tabGroupDbId(tab.groupId);
+  if (tab.openerTabId) pid = await nodeDbId(tab.openerTabId, 'tab');
+  if (pid == null && tab.groupId !== -1) pid = nodeDbId(tab.groupId, 'group');
   if (pid == null && tab.index > 0) {
     const [preceding] = await chrome.tabs.query({ windowId: tab.windowId, index: tab.index - 1 });
     if (preceding) {
@@ -230,8 +219,8 @@ async function onTabCreated(tab) {
       if (row?.parent_id != null) pid = row.parent_id;
     }
   }
-  if (pid == null) pid = await winDbId(tab.windowId);
-  const existingTab = sqlQuery(`SELECT id FROM node WHERE chrome_id=? AND node_type='tab' LIMIT 1`, [tab.id])[0];
+  if (pid == null) pid = await nodeDbId(tab.windowId, 'win');
+  const existingTab = nodeDbId(tab.id, 'tab')[0];
   const turl    = tab.url        ?? '';
   const ttitle  = tab.title      ?? '';
   const tfavicon = tab.favIconUrl ?? '';
@@ -241,7 +230,7 @@ async function onTabCreated(tab) {
   let newTabId;
   if (existingTab) {
     sqlRun(
-      `UPDATE node SET is_open=1, is_saved=0, is_pinned=?, title=?, url=?, domain=?, favicon_url=?, position=?, updated_at=datetime('now') WHERE id=?`,
+      `UPDATE node SET is_open=1, is_pinned=?, title=?, url=?, domain=?, favicon_url=?, position=?, updated_at=datetime('now') WHERE id=?`,
       [tpinned, ttitle, turl, tdomain, tfavicon, tpos, existingTab.id]
     );
     newTabId = existingTab.id;
@@ -252,7 +241,7 @@ async function onTabCreated(tab) {
     );
   }
   await persistDb();
-  const winId = await winDbId(tab.windowId);
+  const winId = await nodeDbId(tab.windowId, 'win');
   if (winId) {
     const autoTags = sqlQuery('SELECT tag_id FROM win_auto_tag WHERE win_node_id=?', [winId]);
     for (const at of autoTags) {
@@ -286,7 +275,7 @@ async function onTabRemoved(tabId, _info) {
   if (shouldSave) {
     sqlRun(`UPDATE node SET is_saved=1, is_open=0, chrome_id=NULL, updated_at=datetime('now') WHERE id=?`, [row.id]);
   } else {
-    sqlRun(`UPDATE node SET parent_id=? WHERE parent_id=? AND node_type='tab' AND is_saved=1`, [row.parent_id, row.id]);
+    sqlRun(`UPDATE node SET parent_id=? WHERE parent_id=?`, [row.parent_id, row.id]);
     sqlRun('DELETE FROM node WHERE id=?', [row.id]);
   }
   await persistDb();
@@ -294,33 +283,34 @@ async function onTabRemoved(tabId, _info) {
 }
 
 async function onTabMoved(tabId, moveInfo) {
-  const id = await tabDbId(tabId);
+  await ensureDb();
+  const id = await nodeDbId(tabId, 'tab');
   if (id == null) return;
-  sqlRun(`UPDATE node SET position=?, updated_at=datetime('now') WHERE id=?`, [moveInfo.toIndex, id]);
+  sqlRun(`UPDATE node SET position=?, updated_at=datetime('now') WHERE id=?`, [moveInfo.toIndex, id]); // TODO: needs to manage the parent_id as well
   await persistDb();
 }
 
 async function onTabUpdated(tabId, changeInfo, tab) {
   await ensureDb();
   if (changeInfo.groupId !== undefined) {
-    const id = await tabDbId(tabId);
+    const id = await nodeDbId(tabId, 'tab');
     if (id != null) {
       const newParentId = changeInfo.groupId !== -1
-        ? (tabGroupDbId(changeInfo.groupId) ?? await winDbId(tab.windowId))
-        : await winDbId(tab.windowId);
-      if (newParentId) sqlRun(`UPDATE node SET parent_id=?, updated_at=datetime('now') WHERE id=?`, [newParentId, id]);
+        ? (nodeDbId(changeInfo.groupId, 'group') ?? await nodeDbId(tab.windowId, 'win'))
+        : await nodeDbId(tab.windowId, 'win');
+      if (newParentId) sqlRun(`UPDATE node SET parent_id=?, updated_at=datetime('now') WHERE id=?`, [newParentId, id]); // TODO: other node parent_id
       await persistDb();
     }
   }
   if (changeInfo.pinned !== undefined) {
-    const id = await tabDbId(tabId);
+    const id = await nodeDbId(tabId, 'tab');
     if (id != null) {
       sqlRun(`UPDATE node SET is_pinned=?, updated_at=datetime('now') WHERE id=?`, [changeInfo.pinned ? 1 : 0, id]);
       await persistDb();
     }
   }
   if (!changeInfo.url && !changeInfo.title && !changeInfo.favIconUrl) return;
-  const id = await tabDbId(tabId);
+  const id = await nodeDbId(tabId, 'tab');
   if (id == null) return;
   const url = tab.url ?? '';
   sqlRun(
@@ -332,13 +322,13 @@ async function onTabUpdated(tabId, changeInfo, tab) {
 
 async function onTabGroupCreated(group) {
   await ensureDb();
-  const winNodeId = sqlQuery(`SELECT id FROM node WHERE node_type='win' AND chrome_id=? LIMIT 1`, [group.windowId])[0]?.id;
+  const winNodeId = nodeDbId(group.windowId, 'win')[0]?.id;
   if (!winNodeId) return;
-  const existing = sqlQuery(`SELECT id FROM node WHERE node_type='group' AND chrome_id=? LIMIT 1`, [group.id])[0];
+  const existing = nodeDbId(group.id, 'group')[0];
   const title = group.title ?? '', color = group.color ?? null, collapsed = group.collapsed ? 1 : 0;
   if (existing) {
     sqlRun(
-      `UPDATE node SET parent_id=?, title=?, color_active=?, is_collapsed=?, is_open=1, is_saved=0, updated_at=datetime('now') WHERE id=?`,
+      `UPDATE node SET parent_id=?, title=?, color_active=?, is_collapsed=?, is_open=1, updated_at=datetime('now') WHERE id=?`,
       [winNodeId, title, color, collapsed, existing.id]
     );
   } else {
@@ -352,13 +342,13 @@ async function onTabGroupCreated(group) {
 
 async function onTabGroupUpdated(group) {
   await ensureDb();
-  const winNodeId = sqlQuery(`SELECT id FROM node WHERE node_type='win' AND chrome_id=? LIMIT 1`, [group.windowId])[0]?.id;
+  const winNodeId = nodeDbId(group.windowId, 'win')[0]?.id;
   if (!winNodeId) return;
-  const existing = sqlQuery(`SELECT id FROM node WHERE node_type='group' AND chrome_id=? LIMIT 1`, [group.id])[0];
+  const existing = nodeDbId(group.id, 'group')[0];
   const title = group.title ?? '', color = group.color ?? null, collapsed = group.collapsed ? 1 : 0;
   if (existing) {
     sqlRun(
-      `UPDATE node SET parent_id=?, title=?, color_active=?, is_collapsed=?, is_open=1, is_saved=0, updated_at=datetime('now') WHERE id=?`,
+      `UPDATE node SET parent_id=?, title=?, color_active=?, is_collapsed=?, is_open=1, updated_at=datetime('now') WHERE id=?`,
       [winNodeId, title, color, collapsed, existing.id]
     );
   } else {
