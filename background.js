@@ -1,6 +1,6 @@
 import {
-  ensureDb, persistDb, sqlQuery, sqlRun, sqlInsert, sqlExec, upsertNode,
-  buildSearchWhere, DEFAULT_QUICK_QUERIES, bgState,
+  ensureDb, persistDb, sqlQuery, sqlRun, sqlInsert, sqlExec,
+  extractDomain, buildSearchWhere, DEFAULT_QUICK_QUERIES, bgState,
 } from './js/bg-db.js';
 import { executeActionRule } from './js/bg-rules.js';
 import { initialize, resync } from './js/bg-sync.js';
@@ -14,7 +14,23 @@ async function handleMessage(cmd, payload) {
   await ensureDb();
   switch (cmd) {
     case 'upsert_node': {
-      const id = upsertNode(payload.node);
+      const node = { ...payload.node };
+      if ('url' in node && !('domain' in node)) node.domain = extractDomain(node.url);
+      let id;
+      if ('id' in node) {
+        const cols = Object.keys(node).filter(k => k !== 'id');
+        sqlRun(
+          `UPDATE node SET ${cols.map(c => `${c}=?`).join(', ')}, updated_at=datetime('now') WHERE id=?`,
+          [...cols.map(c => node[c] ?? null), node.id]
+        );
+        id = node.id;
+      } else {
+        const cols = Object.keys(node);
+        id = sqlInsert(
+          `INSERT INTO node (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
+          cols.map(c => node[c] ?? null)
+        );
+      }
       await persistDb();
       return { ok: true, id };
     }
@@ -78,10 +94,16 @@ async function handleMessage(cmd, payload) {
       );
       if (!savedTabs.length) return { ok: true };
       const newWin = await chrome.windows.create({ url: savedTabs.map(t => t.url) });
-      upsertNode({ id: payload.winNodeId, node_type: 'win', is_open: 1, is_saved: 0, chrome_id: newWin.id });
+      sqlRun(
+        `UPDATE node SET is_open=1, is_saved=0, chrome_id=?, updated_at=datetime('now') WHERE id=?`,
+        [newWin.id, payload.winNodeId]
+      );
       const chromeTabs = newWin.tabs ?? [];
       for (let i = 0; i < Math.min(savedTabs.length, chromeTabs.length); i++) {
-        upsertNode({ id: savedTabs[i].id, chrome_id: chromeTabs[i].id, is_open: 1, is_saved: 0, node_type: 'tab', position: i });
+        sqlRun(
+          `UPDATE node SET chrome_id=?, is_open=1, is_saved=0, position=?, updated_at=datetime('now') WHERE id=?`,
+          [chromeTabs[i].id, i, savedTabs[i].id]
+        );
         bgState.adoptedTabIds.add(chromeTabs[i].id);
       }
       await persistDb();
@@ -108,7 +130,7 @@ async function handleMessage(cmd, payload) {
       if (row?.chrome_id) {
         await chrome.tabs.update(row.chrome_id, { pinned });
       }
-      upsertNode({ id: nodeId, is_pinned: pinned ? 1 : 0 });
+      sqlRun(`UPDATE node SET is_pinned=?, updated_at=datetime('now') WHERE id=?`, [pinned ? 1 : 0, nodeId]);
       await persistDb();
       return { ok: true };
     }
@@ -310,29 +332,40 @@ async function handleMessage(cmd, payload) {
 
       let winNodeId = sqlQuery(`SELECT id FROM node WHERE chrome_id=? AND node_type='win' LIMIT 1`, [newWin.id])[0]?.id;
       if (!winNodeId) {
-        winNodeId = upsertNode({
-          node_type: 'win', is_open: 1, is_saved: 0, chrome_id: newWin.id,
-          win_rect: `${newWin.left}_${newWin.top}_${newWin.width}_${newWin.height}`,
-          relicons: newWin.type ?? 'normal',
-        });
+        winNodeId = sqlInsert(
+          `INSERT INTO node (node_type, is_open, is_saved, chrome_id, win_rect, relicons) VALUES ('win',1,0,?,?,?)`,
+          [newWin.id, `${newWin.left}_${newWin.top}_${newWin.width}_${newWin.height}`, newWin.type ?? 'normal']
+        );
       }
 
       let pos = 0;
       for (const t of openTabs) {
-        upsertNode({ id: t.id, parent_id: winNodeId, position: pos++ });
+        sqlRun(
+          `UPDATE node SET parent_id=?, position=?, updated_at=datetime('now') WHERE id=?`,
+          [winNodeId, pos++, t.id]
+        );
       }
       if (openTabs.length === 0 && savedTabs.length) {
-        upsertNode({ id: savedTabs[0].id, chrome_id: newWin.tabs[0].id, is_open: 1, is_saved: 0, parent_id: winNodeId, position: pos++ });
+        sqlRun(
+          `UPDATE node SET chrome_id=?, is_open=1, is_saved=0, parent_id=?, position=?, updated_at=datetime('now') WHERE id=?`,
+          [newWin.tabs[0].id, winNodeId, pos++, savedTabs[0].id]
+        );
         for (let i = 1; i < savedTabs.length; i++) {
           const newTab = await chrome.tabs.create({ windowId: newWin.id, url: savedTabs[i].url, active: false });
           bgState.adoptedTabIds.add(newTab.id);
-          upsertNode({ id: savedTabs[i].id, chrome_id: newTab.id, is_open: 1, is_saved: 0, parent_id: winNodeId, position: pos++ });
+          sqlRun(
+            `UPDATE node SET chrome_id=?, is_open=1, is_saved=0, parent_id=?, position=?, updated_at=datetime('now') WHERE id=?`,
+            [newTab.id, winNodeId, pos++, savedTabs[i].id]
+          );
         }
       } else {
         for (const t of savedTabs) {
           const newTab = await chrome.tabs.create({ windowId: newWin.id, url: t.url, active: false });
           bgState.adoptedTabIds.add(newTab.id);
-          upsertNode({ id: t.id, chrome_id: newTab.id, is_open: 1, is_saved: 0, parent_id: winNodeId, position: pos++ });
+          sqlRun(
+            `UPDATE node SET chrome_id=?, is_open=1, is_saved=0, parent_id=?, position=?, updated_at=datetime('now') WHERE id=?`,
+            [newTab.id, winNodeId, pos++, t.id]
+          );
         }
       }
 

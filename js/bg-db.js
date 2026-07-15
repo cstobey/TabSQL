@@ -69,7 +69,7 @@ export function sqlExec(sql) {
   db.exec(sql);
 }
 
-function extractDomain(url) {
+export function extractDomain(url) {
   if (!url) return null;
   try { return new URL(url).hostname || null; } catch { return null; }
 }
@@ -99,26 +99,6 @@ export function buildSearchWhere(q) {
   return { where: clauses.length ? clauses.join(' AND ') : '1=1', params };
 }
 
-export function upsertNode(node) {
-  if ('url' in node && !('domain' in node)) {
-    node = { ...node, domain: extractDomain(node.url) };
-  }
-  const cols = Object.keys(node).filter(k => k !== 'id');
-  if ('id' in node) {
-    const set = cols.map(c => `${c} = ?`).join(', ');
-    sqlRun(
-      `UPDATE node SET ${set}, updated_at=datetime('now') WHERE id=?`,
-      [...cols.map(c => node[c] ?? null), node.id]
-    );
-    return node.id;
-  }
-  const colNames = cols.join(', ');
-  const placeholders = cols.map(() => '?').join(', ');
-  return sqlInsert(
-    `INSERT INTO node (${colNames}) VALUES (${placeholders})`,
-    cols.map(c => node[c] ?? null)
-  );
-}
 
 function applySchema() {
   db.exec(`
