@@ -1,9 +1,10 @@
 import {
   ensureDb, persistDb, sqlQuery, sqlRun, sqlInsert, sqlExec,
   extractDomain, buildSearchWhere, DEFAULT_QUICK_QUERIES, bgState,
+  getWinChromeId,
 } from './js/bg-db.js';
 import { executeActionRule } from './js/bg-rules.js';
-import { initialize, resync } from './js/bg-sync.js';
+import { initialize, resync, cascadeChildrenToChrome } from './js/bg-sync.js';
 import './js/bg-popup.js';
 
 // ---------------------------------------------------------------------------
@@ -52,13 +53,38 @@ async function handleMessage(cmd, payload) {
       return { ok: true };
     }
 
-    case 'move_node':
+    case 'move_node': {
+      const { id: mnId, parent_id: mnPid, order_by: mnOb } = payload;
+      // Shift siblings to make room at the target order_by slot
       sqlRun(
-        `UPDATE node SET parent_id=?, position=?, updated_at=datetime('now') WHERE id=?`,
-        [payload.parent_id, payload.position, payload.id]
+        `UPDATE node SET order_by=order_by+1, updated_at=datetime('now') WHERE parent_id=? AND order_by>=? AND id!=?`,
+        [mnPid, mnOb, mnId]
       );
+      sqlRun(
+        `UPDATE node SET parent_id=?, order_by=?, updated_at=datetime('now') WHERE id=?`,
+        [mnPid, mnOb, mnId]
+      );
+      // Sync Chrome tab position if this is an open tab
+      const mnRow = sqlQuery(`SELECT chrome_id, is_open FROM node WHERE id=?`, [mnId])[0];
+      if (mnRow?.is_open && mnRow?.chrome_id) {
+        const winChromeId = getWinChromeId(mnPid);
+        if (winChromeId) {
+          const predecessor = sqlQuery(
+            `SELECT position FROM node WHERE parent_id=? AND order_by<? AND is_open=1 AND chrome_id IS NOT NULL ORDER BY order_by DESC LIMIT 1`,
+            [mnPid, mnOb]
+          )[0];
+          const parentPos = sqlQuery(`SELECT position FROM node WHERE id=?`, [mnPid])[0]?.position ?? 0;
+          const targetIdx = predecessor ? predecessor.position + 1 : parentPos + 1;
+          bgState.movingTabIds.set(mnRow.chrome_id, Date.now());
+          try {
+            await chrome.tabs.move(mnRow.chrome_id, { windowId: winChromeId, index: targetIdx });
+            await cascadeChildrenToChrome(mnId, targetIdx + 1, winChromeId);
+          } catch {}
+        }
+      }
       await persistDb();
       return { ok: true };
+    }
 
     case 'bulk_exec': {
       const sql = payload.sql;
@@ -89,7 +115,7 @@ async function handleMessage(cmd, payload) {
 
     case 'open_saved_window': {
       const savedTabs = sqlQuery(
-        `SELECT id, url, position FROM node WHERE parent_id=? AND node_type='tab' AND is_saved=1 AND url IS NOT NULL ORDER BY position`,
+        `SELECT id, url FROM node WHERE parent_id=? AND node_type='tab' AND is_saved=1 AND url IS NOT NULL ORDER BY order_by`,
         [payload.winNodeId]
       );
       if (!savedTabs.length) return { ok: true };
@@ -341,31 +367,35 @@ async function handleMessage(cmd, payload) {
       let pos = 0;
       for (const t of openTabs) {
         sqlRun(
-          `UPDATE node SET parent_id=?, position=?, updated_at=datetime('now') WHERE id=?`,
-          [winNodeId, pos++, t.id]
+          `UPDATE node SET parent_id=?, position=?, order_by=?, updated_at=datetime('now') WHERE id=?`,
+          [winNodeId, pos, pos, t.id]
         );
+        pos++;
       }
       if (openTabs.length === 0 && savedTabs.length) {
         sqlRun(
-          `UPDATE node SET chrome_id=?, is_open=1, is_saved=0, parent_id=?, position=?, updated_at=datetime('now') WHERE id=?`,
-          [newWin.tabs[0].id, winNodeId, pos++, savedTabs[0].id]
+          `UPDATE node SET chrome_id=?, is_open=1, is_saved=0, parent_id=?, position=?, order_by=?, updated_at=datetime('now') WHERE id=?`,
+          [newWin.tabs[0].id, winNodeId, pos, pos, savedTabs[0].id]
         );
+        pos++;
         for (let i = 1; i < savedTabs.length; i++) {
           const newTab = await chrome.tabs.create({ windowId: newWin.id, url: savedTabs[i].url, active: false });
           bgState.adoptedTabIds.add(newTab.id);
           sqlRun(
-            `UPDATE node SET chrome_id=?, is_open=1, is_saved=0, parent_id=?, position=?, updated_at=datetime('now') WHERE id=?`,
-            [newTab.id, winNodeId, pos++, savedTabs[i].id]
+            `UPDATE node SET chrome_id=?, is_open=1, is_saved=0, parent_id=?, position=?, order_by=?, updated_at=datetime('now') WHERE id=?`,
+            [newTab.id, winNodeId, pos, pos, savedTabs[i].id]
           );
+          pos++;
         }
       } else {
         for (const t of savedTabs) {
           const newTab = await chrome.tabs.create({ windowId: newWin.id, url: t.url, active: false });
           bgState.adoptedTabIds.add(newTab.id);
           sqlRun(
-            `UPDATE node SET chrome_id=?, is_open=1, is_saved=0, parent_id=?, position=?, updated_at=datetime('now') WHERE id=?`,
-            [newTab.id, winNodeId, pos++, t.id]
+            `UPDATE node SET chrome_id=?, is_open=1, is_saved=0, parent_id=?, position=?, order_by=?, updated_at=datetime('now') WHERE id=?`,
+            [newTab.id, winNodeId, pos, pos, t.id]
           );
+          pos++;
         }
       }
 

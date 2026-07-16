@@ -1,4 +1,4 @@
-import { buildSearchWhere, sqlQuery, sqlRun, upsertNode, persistDb } from './bg-db.js';
+import { buildSearchWhere, sqlQuery, sqlRun, persistDb } from './bg-db.js';
 
 export async function executeActionRule(rule) {
   let nodes = [];
@@ -33,12 +33,11 @@ export async function executeActionRule(rule) {
       count++;
     }
   } else if (rule.action_type === 'move' && cfg.target_win_id) {
-    const kids = sqlQuery('SELECT COUNT(*) c FROM node WHERE parent_id=?', [cfg.target_win_id]);
-    let pos = kids[0]?.c ?? 0;
+    let orderBy = (sqlQuery('SELECT MAX(order_by) m FROM node WHERE parent_id=?', [cfg.target_win_id])[0]?.m ?? -1) + 1;
     for (const n of nodes) {
       if (n.node_type === 'tab') {
-        sqlRun(`UPDATE node SET parent_id=?, position=?, updated_at=datetime('now') WHERE id=?`,
-               [cfg.target_win_id, pos++, n.id]);
+        sqlRun(`UPDATE node SET parent_id=?, order_by=?, updated_at=datetime('now') WHERE id=?`,
+               [cfg.target_win_id, orderBy++, n.id]);
         count++;
       }
     }

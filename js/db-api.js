@@ -12,7 +12,7 @@ export const db = {
   },
   query(sql)                        { return this.send('bulk_exec', { sql }); },
   deleteNode(id)                    { return this.send('delete_node', { id }); },
-  moveNode(id, parent_id, position) { return this.send('move_node', { id, parent_id, position }); },
+  moveNode(id, parent_id, order_by) { return this.send('move_node', { id, parent_id, order_by }); },
   upsertNode(node)                  { return this.send('upsert_node', { node }); },
   preOpenTab(nodeId, url)           { return this.send('pre_open_tab', { nodeId, url }); },
   resync()                          { return this.send('resync'); },

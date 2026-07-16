@@ -8,7 +8,7 @@ export async function load() {
   try {
     await syncFocusState();
     const [all, tagsR, nodeTagsR] = await Promise.all([
-      db.query('SELECT * FROM node ORDER BY parent_id NULLS FIRST, position'),
+      db.query('SELECT * FROM node ORDER BY parent_id NULLS FIRST, order_by'),
       db.send('get_tags'),
       db.send('get_all_node_tags'),
     ]);

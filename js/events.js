@@ -271,8 +271,9 @@ treeEl.addEventListener('drop', async e => {
   treeEl.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
   const { parentId } = dropState;
   dropState = null;
-  const pos = childrenOf(parentId).length;
-  await db.moveNode(state.dragSrcId, parentId, pos);
+  const siblings = childrenOf(parentId).filter(n => n.id !== state.dragSrcId);
+  const orderBy = siblings.length > 0 ? siblings[siblings.length - 1].order_by + 1 : 0;
+  await db.moveNode(state.dragSrcId, parentId, orderBy);
   state.dragSrcId = null;
   load();
 });

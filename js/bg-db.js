@@ -16,6 +16,7 @@ export const DEFAULT_QUICK_QUERIES = [
 export const bgState = {
   pendingAdopt:  null,
   adoptedTabIds: new Set(),
+  movingTabIds:  new Map(), // chromeTabId → timestamp; 5s TTL prevents cascade re-entry
 };
 
 let SQL     = null;
@@ -111,6 +112,7 @@ function applySchema() {
       is_open        INTEGER NOT NULL DEFAULT 0,
       is_saved       INTEGER NOT NULL DEFAULT 0,
       is_pinned      INTEGER NOT NULL DEFAULT 0,
+      order_by       INTEGER NOT NULL DEFAULT 0,
       chrome_id      INTEGER DEFAULT NULL,
       title          TEXT,
       url            TEXT,
@@ -186,8 +188,41 @@ function applySchema() {
       value TEXT NOT NULL
     );
   `);
+  // Migration: add order_by; seeds from position on first run only (try fails if column exists)
+  try {
+    db.exec(`ALTER TABLE node ADD COLUMN order_by INTEGER NOT NULL DEFAULT 0`);
+    db.exec(`UPDATE node SET order_by = position`);
+  } catch {}
+
   const count = sqlQuery('SELECT COUNT(*) c FROM quick_query')[0]?.c ?? 0;
   if (+count === 0) seedDefaultQueries();
+}
+
+// Returns [{id, chrome_id}] for all open, chrome-tracked descendants in order_by order (DFS)
+export function getRecursiveOpenChildren(nodeId) {
+  const rows = sqlQuery(
+    `SELECT id, chrome_id FROM node WHERE parent_id=? AND is_open=1 AND chrome_id IS NOT NULL ORDER BY order_by`,
+    [nodeId]
+  );
+  const result = [];
+  for (const row of rows) {
+    result.push(row);
+    result.push(...getRecursiveOpenChildren(row.id));
+  }
+  return result;
+}
+
+// Walks the parent chain to find the containing win node's chrome_id
+export function getWinChromeId(nodeId) {
+  const row = sqlQuery(`
+    WITH RECURSIVE anc(id, node_type, chrome_id, parent_id) AS (
+      SELECT id, node_type, chrome_id, parent_id FROM node WHERE id=?
+      UNION ALL
+      SELECT n.id, n.node_type, n.chrome_id, n.parent_id FROM node n JOIN anc ON n.id=anc.parent_id
+    )
+    SELECT chrome_id FROM anc WHERE node_type='win' AND chrome_id IS NOT NULL LIMIT 1
+  `, [nodeId])[0];
+  return row?.chrome_id ?? null;
 }
 
 export function seedDefaultQueries() {

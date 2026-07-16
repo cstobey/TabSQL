@@ -38,7 +38,7 @@ export function highlightText(text, q) {
 }
 
 export function childrenOf(parentId) {
-  return state.allNodes.filter(n => n.parent_id == parentId).sort((a, b) => a.position - b.position);
+  return state.allNodes.filter(n => n.parent_id == parentId).sort((a, b) => a.order_by - b.order_by);
 }
 
 export function allDescendantIds(nodeId) {
