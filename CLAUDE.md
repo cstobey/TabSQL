@@ -276,6 +276,15 @@ Debounced `load()` call (600ms) triggered by Chrome tab/window events and after 
 - No feature flags or backwards-compat shims
 - Prefer targeted DOM mutations over full re-renders when only one node changes
 - `escHtml()` is defined in tree.js
+- **Prefer SQL over JS logic** — when an operation can be expressed as a SQL query (SELECT, UPDATE, DELETE with subqueries, CTEs, recursive CTEs), do it in SQL rather than looping in JS. Use `node_tree` view for recursive ancestor/descendant queries instead of JS recursion.
+
+## Views
+
+| View | Purpose |
+|---|---|
+| `tab_flat` | All tab nodes joined with their direct parent |
+| `window_summary` | Win nodes with open/total tab counts |
+| `node_tree` | All nodes with `level` (depth, 1=root), `win_node_id` (ancestor win id), `group_node_id` (ancestor group id) — use for recursive descendant queries instead of JS recursion |
 
 ## Known constraints
 

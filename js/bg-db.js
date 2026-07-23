@@ -7,6 +7,7 @@ export const DEFAULT_QUICK_QUERIES = [
   { label: 'Saved tabs',     sql: `SELECT * FROM node WHERE node_type='tab' AND is_saved=1 ORDER BY updated_at DESC LIMIT 100` },
   { label: 'Window summary', sql: `SELECT * FROM window_summary ORDER BY tab_count DESC` },
   { label: 'Tab flat view',  sql: `SELECT * FROM tab_flat LIMIT 100` },
+  { label: 'Node tree',      sql: `SELECT id, node_type, title, level, win_node_id, group_node_id FROM node_tree WHERE is_open=1 ORDER BY win_node_id NULLS FIRST, level, order_by LIMIT 200` },
   { label: 'Duplicate URLs', sql: `SELECT url, COUNT(*) c FROM node WHERE url IS NOT NULL GROUP BY url HAVING c>1 ORDER BY c DESC` },
   { label: 'Recently added', sql: `SELECT * FROM node ORDER BY created_at DESC LIMIT 50` },
   { label: 'All notes',      sql: `SELECT * FROM node WHERE note_text IS NOT NULL ORDER BY updated_at DESC` },
@@ -132,6 +133,20 @@ function applySchema() {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_chrome_type_uniq ON node (node_type, chrome_id) WHERE chrome_id IS NOT NULL;
     DROP VIEW IF EXISTS tab_flat;
     DROP VIEW IF EXISTS window_summary;
+    DROP VIEW IF EXISTS node_tree;
+    CREATE VIEW node_tree AS
+      WITH RECURSIVE tree(id, node_type, level, win_node_id, group_node_id) AS (
+        SELECT id, node_type, 1, NULL, NULL
+        FROM node WHERE parent_id IS NULL
+        UNION ALL
+        SELECT n.id, n.node_type,
+               t.level + 1,
+               CASE WHEN t.node_type = 'win' THEN t.id ELSE t.win_node_id END,
+               CASE WHEN t.node_type = 'group' THEN t.id ELSE t.group_node_id END
+        FROM node n JOIN tree t ON n.parent_id = t.id
+      )
+      SELECT n.*, t.level, t.win_node_id, t.group_node_id
+      FROM node n JOIN tree t ON n.id = t.id;
     CREATE VIEW tab_flat AS
       SELECT n.id, n.node_type, n.title, n.url, n.favicon_url,
              n.is_open, n.is_saved, n.is_collapsed, n.position,

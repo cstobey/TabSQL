@@ -127,6 +127,21 @@ document.getElementById('sql-run').addEventListener('click', () => {
   if (sql) runSQL(sql);
 });
 
+document.getElementById('sql-export-csv').addEventListener('click', () => {
+  if (!sqlLastRows.length) return;
+  const cols = Object.keys(sqlLastRows[0]);
+  const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const lines = [
+    cols.map(esc).join(','),
+    ...sqlLastRows.map(row => cols.map(c => row[c] === null || row[c] === undefined ? '' : esc(row[c])).join(',')),
+  ];
+  const blob = new Blob([lines.join('\r\n')], { type: 'text/csv' });
+  const url  = URL.createObjectURL(blob);
+  const a    = Object.assign(document.createElement('a'), { href: url, download: 'query-results.csv' });
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
 document.getElementById('sql-input').addEventListener('keydown', e => {
   if (e.ctrlKey && e.key === 'Enter') {
     const sql = e.target.value.trim();

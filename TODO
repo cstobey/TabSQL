@@ -1,2 +1,19 @@
 the focus is getting stuck, especially on double-click of a node
 the order_by is still being mangled some.
+on reload, nodes are getting duplicated. 
+reboot saved the tabs, but killed the window.
+
+to deal with these issues and cleanup the code some, we are going to add a recursive view that adds the following columns to the node table: 
+  win_node_id the node.id for any win that this node is a child of. 
+  group_node_id the node.id for any group that this node is a child of. 
+  level int starting at 1 for the top level, and incrementing for each nesting level
+This enables us to easily see both the flat view that chrome sees and the tree veiw we are using. 
+
+in onWindowRemoved, instead of looping over tabs, we can use the view to delete open tabs from the bottom up, setting all children of that node to its parent without worrying about nodes missing because we deleted the above node first. We can also use the win_node_id and group_node_ids to quickly determine if those nodes need to be saved or deleted. 
+
+
+add an option to export the SQL console statement output to csv.
+
+I want the frontend view to be based off of the SQL state so that if I manually run a mutation query, the view automatically gets updated. This also means that if I DELETE nodes that are open, they should be closed. You can get this data by adding a RETURNING clause to `DELETE node` statements that renders the chrome_id column so you close them in chrome. You have to handle the case where there already is a returning clause though and just make sure that the chrome_id is in the list of returned columns. anther option is to just run a resync, but the operations need to be slightly different if a mutation just happened, ie, a DELETE means that we should close tabs that we dont have in the database rather than add then to the database, and and update might mean that we pin tabs in chrome rather than update our db. basically, we are just flipping the source of truth between the 2 views. if we use the new recursive view, the the sync should be easier.
+
+

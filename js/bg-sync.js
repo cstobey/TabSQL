@@ -188,12 +188,7 @@ export async function resync() {
       AND id NOT IN (SELECT id FROM tmp_node WHERE id IS NOT NULL AND node_type='win')
   `);
   for (const row of staleWins) {
-    deleteOpenDescendants(row.id, null);
-    if (hasSavedDescendants(row.id)) {
-      sqlRun(`UPDATE node SET is_saved=1, is_open=0, chrome_id=NULL, updated_at=datetime('now') WHERE id=?`, [row.id]);
-    } else {
-      sqlRun('DELETE FROM node WHERE id=?', [row.id]);
-    }
+    closeWindowNode(row.id);
   }
 
   sqlExec(`DROP TABLE IF EXISTS tmp_node`);
@@ -206,29 +201,35 @@ export async function initialize() {
   console.log('TabSQL initialized');
 }
 
-// ── Stale-window helpers (used by resync) ─────────────────────────────────────
+// ── Window-close helper (used by onWindowRemoved and resync) ─────────────────
 
-function hasSavedDescendants(nodeId) {
-  const children = sqlQuery('SELECT id, is_saved FROM node WHERE parent_id=?', [nodeId]);
-  for (const child of children) {
-    if (child.is_saved) return true;
-    if (hasSavedDescendants(child.id)) return true;
-  }
-  return false;
-}
+function closeWindowNode(winNodeId) {
+  const hasSaved = sqlQuery(
+    `SELECT 1 FROM node_tree WHERE win_node_id=? AND is_saved=1 LIMIT 1`,
+    [winNodeId]
+  ).length > 0;
 
-function deleteOpenDescendants(nodeId, newParentId) {
-  const children = sqlQuery('SELECT id, node_type, is_saved FROM node WHERE parent_id=?', [nodeId]);
-  for (const child of children) {
-    if (child.is_saved) {
-      sqlRun(`UPDATE node SET parent_id=? WHERE id=?`, [newParentId, child.id]);
-    } else if (child.node_type === 'tab') {
-      deleteOpenDescendants(child.id, newParentId ?? nodeId);
-      sqlRun('DELETE FROM node WHERE id=?', [child.id]);
-    } else if (child.node_type === 'group') {
-      deleteOpenDescendants(child.id, newParentId);
-      sqlRun('DELETE FROM node WHERE id=?', [child.id]);
-    }
+  if (hasSaved) {
+    // Reparent saved descendants of open parents to the win node before deleting open nodes
+    sqlRun(`
+      UPDATE node SET parent_id=?
+      WHERE is_saved=1
+        AND parent_id IN (SELECT id FROM node_tree WHERE win_node_id=? AND is_saved=0)
+    `, [winNodeId, winNodeId]);
+    sqlRun(
+      `DELETE FROM node WHERE id IN (SELECT id FROM node_tree WHERE win_node_id=? AND is_saved=0)`,
+      [winNodeId]
+    );
+    sqlRun(
+      `UPDATE node SET is_saved=1, is_open=0, chrome_id=NULL, updated_at=datetime('now') WHERE id=?`,
+      [winNodeId]
+    );
+  } else {
+    sqlRun(
+      `DELETE FROM node WHERE id IN (SELECT id FROM node_tree WHERE win_node_id=?)`,
+      [winNodeId]
+    );
+    sqlRun(`DELETE FROM node WHERE id=?`, [winNodeId]);
   }
 }
 
@@ -275,12 +276,7 @@ async function onWindowRemoved(winId) {
   }
   const winNodeId = nodeDbId(winId, 'win');
   if (!winNodeId) return;
-  deleteOpenDescendants(winNodeId, null);
-  if (hasSavedDescendants(winNodeId)) {
-    sqlRun(`UPDATE node SET is_saved=1, is_open=0, chrome_id=NULL, updated_at=datetime('now') WHERE id=?`, [winNodeId]);
-  } else {
-    sqlRun('DELETE FROM node WHERE id=?', [winNodeId]);
-  }
+  closeWindowNode(winNodeId);
   await persistDb();
   await updateBadge();
 }

@@ -312,8 +312,9 @@ chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
   for (const chromeId of [...state.focusState.activeTabChromeIds]) {
     const node = state.allNodes.find(n => n.chrome_id === chromeId);
     if (node) {
-      const parentWin = state.nodeMap[node.parent_id];
-      if (parentWin && parentWin.chrome_id === windowId) {
+      let cur = state.nodeMap[node.parent_id];
+      while (cur && cur.node_type !== 'win') cur = state.nodeMap[cur.parent_id];
+      if (cur && cur.chrome_id === windowId) {
         state.focusState.activeTabChromeIds.delete(chromeId);
       }
     }
