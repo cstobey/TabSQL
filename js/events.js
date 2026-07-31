@@ -30,9 +30,9 @@ treeEl.addEventListener('click', e => {
   node.classList.add('selected');
 
   if (e.detail === 2) {
-    if (n?.node_type === 'win' && !n.is_saved && n?.chrome_id) {
+    if (n?.node_type === 'win' && n.is_open && n?.chrome_id) {
       chrome.windows.update(n.chrome_id, { focused: true });
-    } else if (n?.node_type === 'win' && n.is_saved) {
+    } else if (n?.node_type === 'win' && !n.is_open) {
       db.send('open_saved_window', { winNodeId: n.id })
         .then(() => scheduleRefresh())
         .catch(console.error);
@@ -43,7 +43,7 @@ treeEl.addEventListener('click', e => {
       }).catch(() => {
         if (n.url) chrome.tabs.create({ url: n.url });
       });
-    } else if (n?.node_type === 'tab' && n.is_saved && n?.url) {
+    } else if (n?.node_type === 'tab' && !n.is_open && n?.url) {
       db.preOpenTab(n.id, n.url).catch(() => {}).finally(() => {
         chrome.tabs.create({ url: n.url });
       });
@@ -105,10 +105,11 @@ treeEl.addEventListener('click', async e => {
   }
 
   if (btn.classList.contains('act-save')) {
-    if (n.chrome_id) {
+    // Mark saved first so onTabRemoved keeps the node in place
+    await db.upsertNode({ id, is_saved: 1 });
+    if (n.is_open && n.chrome_id) {
       try { await chrome.tabs.remove(n.chrome_id); } catch {}
     }
-    await db.upsertNode({ id, node_type: 'tab', is_saved: 1, is_open: 0, chrome_id: null });
     scheduleRefresh();
     return;
   }
@@ -126,19 +127,28 @@ treeEl.addEventListener('click', async e => {
   }
 
   if (btn.classList.contains('act-del')) {
-    const descIds = allDescendantIds(id);
-    if (n.node_type === 'win' && !n.is_saved && n.chrome_id) {
-      try { await chrome.windows.remove(n.chrome_id); } catch {}
-    } else if (n.chrome_id && n.is_open) {
-      try { await chrome.tabs.remove(n.chrome_id); } catch {}
-    }
-    await db.deleteNode(id);
-    state.allNodes = state.allNodes.filter(x => !descIds.has(x.id));
-    state.nodeMap  = Object.fromEntries(state.allNodes.map(x => [x.id, x]));
-    recomputeDupUrls();
-    await render(state.allNodes, document.getElementById('search').value);
+    await deleteSubtree(n);
   }
 });
+
+// Deleting always closes the Chrome side of the subtree too. Rows are deleted first
+// so the resulting Chrome events find nothing; tabs close before the window so an
+// emptied window closes itself and the windows.remove is just a fallback.
+async function deleteSubtree(n) {
+  const descIds = allDescendantIds(n.id);
+  const closeTabs = [...descIds].map(d => state.nodeMap[d])
+    .filter(x => x?.node_type === 'tab' && x.is_open && x.chrome_id)
+    .map(x => x.chrome_id);
+  await db.deleteNode(n.id);
+  if (closeTabs.length) { try { await chrome.tabs.remove(closeTabs); } catch {} }
+  if (n.node_type === 'win' && n.is_open && n.chrome_id) {
+    try { await chrome.windows.remove(n.chrome_id); } catch {}
+  }
+  state.allNodes = state.allNodes.filter(x => !descIds.has(x.id));
+  state.nodeMap  = Object.fromEntries(state.allNodes.map(x => [x.id, x]));
+  recomputeDupUrls();
+  await render(state.allNodes, document.getElementById('search').value);
+}
 
 // ── Context menu ──────────────────────────────────────────────────────────────
 
@@ -181,22 +191,11 @@ ctx.addEventListener('click', async e => {
   } else if (action === 'tags') {
     ctx.classList.add('hidden');
     openTagPicker(state.selected, ctx._lastX, ctx._lastY);
+  } else if (action === 'toggle-saved') {
+    await db.upsertNode({ id: state.selected, is_saved: n.is_saved ? 0 : 1 });
+    scheduleRefresh();
   } else if (action === 'delete') {
-    const descIds = allDescendantIds(state.selected);
-    const kidCount = descIds.size - 1;
-    const suffix = kidCount > 0 ? ` and ${kidCount} child node${kidCount > 1 ? 's' : ''}` : '';
-    if (confirm(`Delete "${nodeLabel(n)}"${suffix}?`)) {
-      if (n.node_type === 'win' && !n.is_saved && n.chrome_id) {
-        try { await chrome.windows.remove(n.chrome_id); } catch {}
-      } else if (n.chrome_id && n.is_open) {
-        try { await chrome.tabs.remove(n.chrome_id); } catch {}
-      }
-      await db.deleteNode(state.selected);
-      state.allNodes = state.allNodes.filter(x => !descIds.has(x.id));
-      state.nodeMap  = Object.fromEntries(state.allNodes.map(x => [x.id, x]));
-      recomputeDupUrls();
-      await render(state.allNodes, document.getElementById('search').value);
-    }
+    await deleteSubtree(n);
   }
 });
 

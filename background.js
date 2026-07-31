@@ -1,11 +1,13 @@
 import {
   ensureDb, persistDb, sqlQuery, sqlRun, sqlInsert, sqlExec,
   extractDomain, buildSearchWhere, DEFAULT_QUICK_QUERIES, bgState,
-  getWinChromeId,
+  getWinChromeId, sessionId, renumberOrderBy, rowsModified,
 } from './js/bg-db.js';
 import { executeActionRule } from './js/bg-rules.js';
 import { initialize, resync, cascadeChildrenToChrome } from './js/bg-sync.js';
 import './js/bg-popup.js';
+
+const LEAF_TABS = `node_type='tab' AND url != '' AND id NOT IN (SELECT DISTINCT parent_id FROM node WHERE parent_id IS NOT NULL)`;
 
 // ---------------------------------------------------------------------------
 // Message handler
@@ -26,6 +28,7 @@ async function handleMessage(cmd, payload) {
         );
         id = node.id;
       } else {
+        if (node.parent_id === undefined && node.node_type !== 'session') node.parent_id = sessionId();
         const cols = Object.keys(node);
         id = sqlInsert(
           `INSERT INTO node (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
@@ -37,44 +40,49 @@ async function handleMessage(cmd, payload) {
     }
 
     case 'delete_node': {
-      const toDelete = [payload.id];
-      const queue = [payload.id];
-      while (queue.length) {
-        const pid = queue.shift();
-        const kids = sqlQuery('SELECT id FROM node WHERE parent_id=?', [pid]);
-        kids.forEach(k => { toDelete.push(k.id); queue.push(k.id); });
-      }
-      toDelete.forEach(id => {
-        sqlRun('DELETE FROM node_tag WHERE node_id=?', [id]);
-        sqlRun('DELETE FROM win_auto_tag WHERE win_node_id=?', [id]);
-        sqlRun('DELETE FROM node WHERE id=?', [id]);
-      });
+      const id = Math.trunc(+payload.id);
+      sqlExec(`
+        DROP TABLE IF EXISTS tmp_doomed;
+        CREATE TEMP TABLE tmp_doomed AS
+          WITH RECURSIVE d(id) AS (
+            SELECT ${id} UNION ALL SELECT n.id FROM node n JOIN d ON n.parent_id = d.id
+          ) SELECT id FROM d;
+        DELETE FROM node_tag     WHERE node_id     IN (SELECT id FROM tmp_doomed);
+        DELETE FROM win_auto_tag WHERE win_node_id IN (SELECT id FROM tmp_doomed);
+        DELETE FROM node         WHERE id          IN (SELECT id FROM tmp_doomed);
+        DROP TABLE tmp_doomed;
+      `);
       await persistDb();
       return { ok: true };
     }
 
+    // TabSQL-initiated move: the whole subtree follows in Chrome (cascade). The node
+    // slots in just before the sibling holding the requested order_by; renumber packs
+    // the fractional slot back to integers on both affected parents.
     case 'move_node': {
-      const { id: mnId, parent_id: mnPid, order_by: mnOb } = payload;
-      // Shift siblings to make room at the target order_by slot
+      const { id: mnId, order_by: mnOb } = payload;
+      const mnPid = payload.parent_id ?? sessionId();
+      const oldPid = sqlQuery(`SELECT parent_id FROM node WHERE id=?`, [mnId])[0]?.parent_id;
       sqlRun(
-        `UPDATE node SET order_by=order_by+1, updated_at=datetime('now') WHERE parent_id=? AND order_by>=? AND id!=?`,
+        `UPDATE node SET parent_id=?, order_by=? - 0.5, updated_at=datetime('now') WHERE id=?`,
         [mnPid, mnOb, mnId]
       );
-      sqlRun(
-        `UPDATE node SET parent_id=?, order_by=?, updated_at=datetime('now') WHERE id=?`,
-        [mnPid, mnOb, mnId]
-      );
-      // Sync Chrome tab position if this is an open tab
+      renumberOrderBy([mnPid, oldPid].filter(p => p != null));
       const mnRow = sqlQuery(`SELECT chrome_id, is_open FROM node WHERE id=?`, [mnId])[0];
       if (mnRow?.is_open && mnRow?.chrome_id) {
         const winChromeId = getWinChromeId(mnPid);
         if (winChromeId) {
-          const predecessor = sqlQuery(
-            `SELECT position FROM node WHERE parent_id=? AND order_by<? AND is_open=1 AND chrome_id IS NOT NULL ORDER BY order_by DESC LIMIT 1`,
-            [mnPid, mnOb]
+          const pred = sqlQuery(
+            `SELECT position FROM node
+             WHERE parent_id=? AND is_open=1 AND chrome_id IS NOT NULL AND id!=?
+               AND order_by < (SELECT order_by FROM node WHERE id=?)
+             ORDER BY order_by DESC LIMIT 1`,
+            [mnPid, mnId, mnId]
           )[0];
-          const parentPos = sqlQuery(`SELECT position FROM node WHERE id=?`, [mnPid])[0]?.position ?? 0;
-          const targetIdx = predecessor ? predecessor.position + 1 : parentPos + 1;
+          const parent = sqlQuery(`SELECT node_type, position FROM node WHERE id=?`, [mnPid])[0];
+          const targetIdx = pred ? pred.position + 1
+                          : parent?.node_type === 'win' ? 0
+                          : (parent?.position ?? 0) + 1;
           bgState.movingTabIds.set(mnRow.chrome_id, Date.now());
           try {
             await chrome.tabs.move(mnRow.chrome_id, { windowId: winChromeId, index: targetIdx });
@@ -105,54 +113,73 @@ async function handleMessage(cmd, payload) {
         params
       );
       const matchedCount = rows.filter(r => r.is_matched).length;
-      const visibleIds = rows.map(r => r.id);
-      return { ok: true, matchedCount, visibleIds };
+      return { ok: true, matchedCount, visibleIds: rows.map(r => r.id) };
     }
 
     case 'pre_open_tab':
       bgState.pendingAdopt = { nodeId: payload.nodeId, url: payload.url, ts: Date.now() };
       return { ok: true };
 
+    // Reopens every saved descendant tab (DFS tree order) in a new window and grafts
+    // the new chrome ids onto the existing nodes. pendingWinAdopt stops onWindowCreated
+    // from inserting a duplicate win node; the conflict-clearing UPDATE undoes any
+    // silent per-tab adoption that raced us. is_saved stays 1 throughout (sticky).
     case 'open_saved_window': {
-      const savedTabs = sqlQuery(
-        `SELECT id, url FROM node WHERE parent_id=? AND node_type='tab' AND is_saved=1 AND url IS NOT NULL ORDER BY order_by`,
-        [payload.winNodeId]
-      );
+      const wid = Math.trunc(+payload.winNodeId);
+      const savedTabs = sqlQuery(`
+        WITH RECURSIVE d(id, url, is_open, is_saved, node_type, path) AS (
+          SELECT id, url, is_open, is_saved, node_type, printf('%08d', order_by) FROM node WHERE parent_id=?
+          UNION ALL
+          SELECT n.id, n.url, n.is_open, n.is_saved, n.node_type, d.path || '/' || printf('%08d', n.order_by)
+          FROM node n JOIN d ON n.parent_id = d.id
+        )
+        SELECT id, url FROM d WHERE node_type='tab' AND is_saved=1 AND is_open=0 AND url != '' ORDER BY path
+      `, [wid]);
       if (!savedTabs.length) return { ok: true };
+      bgState.pendingWinAdopt = { nodeId: wid, ts: Date.now() };
       const newWin = await chrome.windows.create({ url: savedTabs.map(t => t.url) });
-      sqlRun(
-        `UPDATE node SET is_open=1, is_saved=0, chrome_id=?, updated_at=datetime('now') WHERE id=?`,
-        [newWin.id, payload.winNodeId]
-      );
       const chromeTabs = newWin.tabs ?? [];
-      for (let i = 0; i < Math.min(savedTabs.length, chromeTabs.length); i++) {
+      chromeTabs.forEach(t => bgState.adoptedTabIds.add(t.id));
+      const n = Math.min(savedTabs.length, chromeTabs.length);
+      if (n) {
+        sqlExec(`DROP TABLE IF EXISTS tmp_open; CREATE TEMP TABLE tmp_open (node_id INTEGER PRIMARY KEY, chrome_id INTEGER, pos INTEGER);`);
         sqlRun(
-          `UPDATE node SET chrome_id=?, is_open=1, is_saved=0, position=?, updated_at=datetime('now') WHERE id=?`,
-          [chromeTabs[i].id, i, savedTabs[i].id]
+          `INSERT INTO tmp_open VALUES ${Array.from({ length: n }, () => '(?,?,?)').join(',')}`,
+          Array.from({ length: n }).flatMap((_, i) => [savedTabs[i].id, chromeTabs[i].id, i])
         );
-        bgState.adoptedTabIds.add(chromeTabs[i].id);
+        sqlExec(`
+          UPDATE node SET chrome_id=NULL, is_open=0, updated_at=datetime('now')
+            WHERE node_type='tab' AND chrome_id IN (SELECT chrome_id FROM tmp_open)
+              AND id NOT IN (SELECT node_id FROM tmp_open);
+          UPDATE node SET
+              chrome_id = (SELECT chrome_id FROM tmp_open o WHERE o.node_id = node.id),
+              position  = (SELECT pos       FROM tmp_open o WHERE o.node_id = node.id),
+              is_open=1, updated_at=datetime('now')
+            WHERE id IN (SELECT node_id FROM tmp_open);
+          DROP TABLE tmp_open;
+        `);
       }
+      sqlRun(`UPDATE node SET is_open=1, chrome_id=?, updated_at=datetime('now') WHERE id=?`, [newWin.id, wid]);
       await persistDb();
       return { ok: true };
     }
 
     case 'save_window': {
-      const openTabs = sqlQuery(
-        `SELECT id, chrome_id FROM node WHERE parent_id=? AND node_type='tab' AND is_saved=0`,
-        [payload.winNodeId]
-      );
-      for (const t of openTabs) {
-        sqlRun(`UPDATE node SET is_saved=1, updated_at=datetime('now') WHERE id=?`, [t.id]);
-      }
+      const wid = Math.trunc(+payload.winNodeId);
+      sqlExec(`
+        UPDATE node SET is_saved=1, updated_at=datetime('now')
+        WHERE is_saved=0
+          AND (id=${wid} OR id IN (SELECT id FROM node_tree WHERE win_node_id=${wid} AND node_type='tab'));
+      `);
       await persistDb();
-      const winRow = sqlQuery('SELECT chrome_id FROM node WHERE id=?', [payload.winNodeId])[0];
+      const winRow = sqlQuery(`SELECT chrome_id FROM node WHERE id=? AND is_open=1`, [wid])[0];
       if (winRow?.chrome_id) { try { await chrome.windows.remove(winRow.chrome_id); } catch {} }
       return { ok: true };
     }
 
     case 'set_tab_pinned': {
       const { nodeId, pinned } = payload;
-      const row = sqlQuery('SELECT chrome_id FROM node WHERE id=?', [nodeId])[0];
+      const row = sqlQuery(`SELECT chrome_id FROM node WHERE id=?`, [nodeId])[0];
       if (row?.chrome_id) {
         await chrome.tabs.update(row.chrome_id, { pinned });
       }
@@ -161,20 +188,18 @@ async function handleMessage(cmd, payload) {
       return { ok: true };
     }
 
-    case 'get_quick_queries': {
-      const rows = sqlQuery('SELECT * FROM quick_query ORDER BY position, label');
-      return { ok: true, rows };
-    }
+    case 'get_quick_queries':
+      return { ok: true, rows: sqlQuery(`SELECT * FROM quick_query ORDER BY position, label`) };
 
     case 'save_quick_query': {
       const { id, label, sql } = payload;
       if (id) {
-        sqlRun('UPDATE quick_query SET label=?, sql=? WHERE id=?', [label, sql, id]);
+        sqlRun(`UPDATE quick_query SET label=?, sql=? WHERE id=?`, [label, sql, id]);
       } else {
-        const maxPos = sqlQuery('SELECT MAX(position) m FROM quick_query')[0]?.m ?? -1;
-        sqlInsert(
-          'INSERT INTO quick_query (label, sql, position, is_default) VALUES (?,?,?,0)',
-          [label, sql, maxPos + 1]
+        sqlRun(
+          `INSERT INTO quick_query (label, sql, position, is_default)
+           VALUES (?,?,(SELECT COALESCE(MAX(position),-1)+1 FROM quick_query),0)`,
+          [label, sql]
         );
       }
       await persistDb();
@@ -182,7 +207,7 @@ async function handleMessage(cmd, payload) {
     }
 
     case 'delete_quick_query':
-      sqlRun('DELETE FROM quick_query WHERE id=?', [payload.id]);
+      sqlRun(`DELETE FROM quick_query WHERE id=?`, [payload.id]);
       await persistDb();
       return { ok: true };
 
@@ -193,82 +218,77 @@ async function handleMessage(cmd, payload) {
     }
 
     case 'seed_default_queries': {
-      const existing = new Set(
-        sqlQuery('SELECT label FROM quick_query').map(r => r.label)
+      sqlRun(
+        `INSERT INTO quick_query (label, sql, position, is_default)
+         SELECT column1, column2, column3, 1 FROM (VALUES ${DEFAULT_QUICK_QUERIES.map(() => '(?,?,?)').join(',')})
+         WHERE column1 NOT IN (SELECT label FROM quick_query)`,
+        DEFAULT_QUICK_QUERIES.flatMap((q, i) => [q.label, q.sql, i])
       );
-      let added = 0;
-      DEFAULT_QUICK_QUERIES.forEach((q, i) => {
-        if (!existing.has(q.label)) {
-          sqlInsert(
-            'INSERT INTO quick_query (label, sql, position, is_default) VALUES (?,?,?,1)',
-            [q.label, q.sql, i]
-          );
-          added++;
-        }
-      });
+      const added = rowsModified();
       await persistDb();
       return { ok: true, added };
     }
 
     // ── Tags ──────────────────────────────────────────────────────────────────
     case 'get_tags':
-      return { ok: true, rows: sqlQuery('SELECT * FROM tag ORDER BY name') };
+      return { ok: true, rows: sqlQuery(`SELECT * FROM tag ORDER BY name`) };
 
     case 'save_tag': {
       const { id: tid, name: tname, color: tcolor } = payload;
-      if (tid) {
-        sqlRun('UPDATE tag SET name=?, color=? WHERE id=?', [tname, tcolor, tid]);
-        await persistDb();
-        return { ok: true, id: tid };
-      }
-      const newId = sqlInsert('INSERT INTO tag (name, color) VALUES (?,?)', [tname, tcolor]);
+      const newId = tid
+        ? (sqlRun(`UPDATE tag SET name=?, color=? WHERE id=?`, [tname, tcolor, tid]), tid)
+        : sqlInsert(`INSERT INTO tag (name, color) VALUES (?,?)`, [tname, tcolor]);
       await persistDb();
       return { ok: true, id: newId };
     }
 
     case 'delete_tag': {
-      sqlRun('DELETE FROM node_tag WHERE tag_id=?', [payload.id]);
-      sqlRun('DELETE FROM win_auto_tag WHERE tag_id=?', [payload.id]);
-      sqlRun('DELETE FROM tag WHERE id=?', [payload.id]);
+      const tid = Math.trunc(+payload.id);
+      sqlExec(`
+        DELETE FROM node_tag     WHERE tag_id=${tid};
+        DELETE FROM win_auto_tag WHERE tag_id=${tid};
+        DELETE FROM tag          WHERE id=${tid};
+      `);
       await persistDb();
       return { ok: true };
     }
 
-    case 'get_node_tags': {
-      const rows = sqlQuery(
-        'SELECT t.* FROM tag t JOIN node_tag nt ON t.id=nt.tag_id WHERE nt.node_id=?',
-        [payload.nodeId]
-      );
-      return { ok: true, rows };
-    }
+    case 'get_node_tags':
+      return {
+        ok: true,
+        rows: sqlQuery(`SELECT t.* FROM tag t JOIN node_tag nt ON t.id=nt.tag_id WHERE nt.node_id=?`, [payload.nodeId]),
+      };
 
-    case 'get_all_node_tags': {
-      const rows = sqlQuery('SELECT nt.node_id, t.id, t.name, t.color FROM node_tag nt JOIN tag t ON t.id=nt.tag_id');
-      return { ok: true, rows };
-    }
+    case 'get_all_node_tags':
+      return {
+        ok: true,
+        rows: sqlQuery(`SELECT nt.node_id, t.id, t.name, t.color FROM node_tag nt JOIN tag t ON t.id=nt.tag_id`),
+      };
 
     case 'set_node_tags': {
-      sqlRun('DELETE FROM node_tag WHERE node_id=?', [payload.nodeId]);
-      for (const tid of (payload.tagIds ?? [])) {
-        sqlRun('INSERT OR IGNORE INTO node_tag (node_id, tag_id) VALUES (?,?)', [payload.nodeId, tid]);
+      sqlRun(`DELETE FROM node_tag WHERE node_id=?`, [payload.nodeId]);
+      const tids = (payload.tagIds ?? []).map(Number).filter(Number.isFinite);
+      if (tids.length) {
+        sqlRun(
+          `INSERT OR IGNORE INTO node_tag (node_id, tag_id) VALUES ${tids.map(() => '(?,?)').join(',')}`,
+          tids.flatMap(t => [payload.nodeId, t])
+        );
       }
       await persistDb();
       return { ok: true };
     }
 
-    case 'get_win_auto_tags': {
-      const rows = sqlQuery(
-        'SELECT t.* FROM tag t JOIN win_auto_tag wat ON t.id=wat.tag_id WHERE wat.win_node_id=?',
-        [payload.winNodeId]
-      );
-      return { ok: true, rows };
-    }
+    case 'get_win_auto_tags':
+      return {
+        ok: true,
+        rows: sqlQuery(`SELECT t.* FROM tag t JOIN win_auto_tag wat ON t.id=wat.tag_id WHERE wat.win_node_id=?`, [payload.winNodeId]),
+      };
 
     case 'set_win_auto_tag': {
       if (payload.enabled) {
-        sqlRun('INSERT OR IGNORE INTO win_auto_tag (win_node_id, tag_id) VALUES (?,?)', [payload.winNodeId, payload.tagId]);
+        sqlRun(`INSERT OR IGNORE INTO win_auto_tag (win_node_id, tag_id) VALUES (?,?)`, [payload.winNodeId, payload.tagId]);
       } else {
-        sqlRun('DELETE FROM win_auto_tag WHERE win_node_id=? AND tag_id=?', [payload.winNodeId, payload.tagId]);
+        sqlRun(`DELETE FROM win_auto_tag WHERE win_node_id=? AND tag_id=?`, [payload.winNodeId, payload.tagId]);
       }
       await persistDb();
       return { ok: true };
@@ -276,181 +296,171 @@ async function handleMessage(cmd, payload) {
 
     case 'tag_search_results': {
       const { where, params } = buildSearchWhere(payload.q);
-      const matched = sqlQuery(`SELECT id, node_type FROM node WHERE ${where} LIMIT 1000`, params);
-      for (const n of matched) {
-        sqlRun('INSERT OR IGNORE INTO node_tag (node_id, tag_id) VALUES (?,?)', [n.id, payload.tagId]);
-        if (n.node_type === 'win') {
-          sqlRun('INSERT OR IGNORE INTO win_auto_tag (win_node_id, tag_id) VALUES (?,?)', [n.id, payload.tagId]);
-          const kids = sqlQuery('SELECT id FROM node WHERE parent_id=?', [n.id]);
-          for (const k of kids) {
-            sqlRun('INSERT OR IGNORE INTO node_tag (node_id, tag_id) VALUES (?,?)', [k.id, payload.tagId]);
-          }
-        }
-      }
+      const tagId = Math.trunc(+payload.tagId);
+      sqlExec(`DROP TABLE IF EXISTS tmp_m; CREATE TEMP TABLE tmp_m (id INTEGER PRIMARY KEY, node_type TEXT);`);
+      sqlRun(`INSERT INTO tmp_m SELECT id, node_type FROM node WHERE ${where} LIMIT 1000`, params);
+      sqlExec(`
+        INSERT OR IGNORE INTO node_tag (node_id, tag_id) SELECT id, ${tagId} FROM tmp_m;
+        INSERT OR IGNORE INTO win_auto_tag (win_node_id, tag_id) SELECT id, ${tagId} FROM tmp_m WHERE node_type='win';
+        INSERT OR IGNORE INTO node_tag (node_id, tag_id)
+          SELECT n.id, ${tagId} FROM node n WHERE n.parent_id IN (SELECT id FROM tmp_m WHERE node_type='win');
+      `);
+      const count = sqlQuery(`SELECT COUNT(*) c FROM tmp_m`)[0].c;
+      sqlExec(`DROP TABLE tmp_m`);
       await persistDb();
-      return { ok: true, count: matched.length };
+      return { ok: true, count };
     }
 
     // ── Action rules ─────────────────────────────────────────────────────────
     case 'get_action_rules':
-      return { ok: true, rows: sqlQuery('SELECT * FROM action_rule ORDER BY position, id') };
+      return { ok: true, rows: sqlQuery(`SELECT * FROM action_rule ORDER BY position, id`) };
 
     case 'save_action_rule': {
       const { id: aid, name: aname, action_type, condition_type, condition, config, is_auto, position: apos } = payload;
       if (aid) {
         sqlRun(
-          'UPDATE action_rule SET name=?, action_type=?, condition_type=?, condition=?, config=?, is_auto=? WHERE id=?',
+          `UPDATE action_rule SET name=?, action_type=?, condition_type=?, condition=?, config=?, is_auto=? WHERE id=?`,
           [aname, action_type, condition_type, condition, config ?? null, is_auto ? 1 : 0, aid]
         );
         await persistDb();
         return { ok: true, id: aid };
       }
-      const maxPos = sqlQuery('SELECT MAX(position) m FROM action_rule')[0]?.m ?? -1;
       const newId = sqlInsert(
-        'INSERT INTO action_rule (name, action_type, condition_type, condition, config, is_auto, position) VALUES (?,?,?,?,?,?,?)',
-        [aname, action_type, condition_type, condition, config ?? null, is_auto ? 1 : 0, (apos ?? maxPos + 1)]
+        `INSERT INTO action_rule (name, action_type, condition_type, condition, config, is_auto, position)
+         VALUES (?,?,?,?,?,?,COALESCE(?,(SELECT COALESCE(MAX(position),-1)+1 FROM action_rule)))`,
+        [aname, action_type, condition_type, condition, config ?? null, is_auto ? 1 : 0, apos ?? null]
       );
       await persistDb();
       return { ok: true, id: newId };
     }
 
     case 'delete_action_rule':
-      sqlRun('DELETE FROM action_rule WHERE id=?', [payload.id]);
+      sqlRun(`DELETE FROM action_rule WHERE id=?`, [payload.id]);
       await persistDb();
       return { ok: true };
 
     case 'run_action_rule': {
-      const rule = sqlQuery('SELECT * FROM action_rule WHERE id=?', [payload.id])[0];
+      const rule = sqlQuery(`SELECT * FROM action_rule WHERE id=?`, [payload.id])[0];
       if (!rule) return { ok: false, error: 'Rule not found' };
-      const affected = await executeActionRule(rule);
-      return { ok: true, affected };
+      return { ok: true, affected: await executeActionRule(rule) };
     }
 
     case 'run_auto_actions': {
-      const rules = sqlQuery('SELECT * FROM action_rule WHERE is_auto=1');
       let total = 0;
-      for (const rule of rules) total += await executeActionRule(rule);
-      if (total > 0) await persistDb();
+      for (const rule of sqlQuery(`SELECT * FROM action_rule WHERE is_auto=1 ORDER BY position, id`)) {
+        total += await executeActionRule(rule);
+      }
       return { ok: true, total };
     }
 
+    // Moves matching leaf tabs into a new window: open tabs chrome-move (sentinels keep
+    // our own events from re-reparenting), saved tabs reopen fresh reusing their nodes.
     case 'open_search_in_window': {
       const { where, params } = buildSearchWhere(payload.q);
       const tabs = sqlQuery(
-        `SELECT id, url, is_open, chrome_id, is_saved FROM node WHERE (${where}) AND node_type='tab' AND url IS NOT NULL AND id NOT IN (SELECT DISTINCT parent_id FROM node WHERE parent_id IS NOT NULL) LIMIT 50`,
+        `SELECT id, url, is_open, chrome_id FROM node WHERE (${where}) AND ${LEAF_TABS} LIMIT 50`,
         params
       );
       if (!tabs.length) return { ok: true, moved: 0 };
-
-      const openTabs  = tabs.filter(t => t.is_open && t.chrome_id);
-      const savedTabs = tabs.filter(t => !t.is_open || !t.chrome_id);
+      const open  = tabs.filter(t => t.is_open && t.chrome_id);
+      const saved = tabs.filter(t => !t.is_open || !t.chrome_id);
 
       let newWin;
-      if (openTabs.length) {
-        newWin = await chrome.windows.create({ tabId: openTabs[0].chrome_id });
-        for (let i = 1; i < openTabs.length; i++) {
-          await chrome.tabs.move(openTabs[i].chrome_id, { windowId: newWin.id, index: -1 });
+      if (open.length) {
+        bgState.movingTabIds.set(open[0].chrome_id, Date.now());
+        newWin = await chrome.windows.create({ tabId: open[0].chrome_id });
+        for (const t of open.slice(1)) {
+          bgState.movingTabIds.set(t.chrome_id, Date.now());
+          try { await chrome.tabs.move(t.chrome_id, { windowId: newWin.id, index: -1 }); } catch {}
         }
       } else {
-        newWin = await chrome.windows.create({ url: savedTabs[0].url });
+        newWin = await chrome.windows.create({ url: saved[0].url });
         bgState.adoptedTabIds.add(newWin.tabs[0].id);
       }
 
       let winNodeId = sqlQuery(`SELECT id FROM node WHERE chrome_id=? AND node_type='win' LIMIT 1`, [newWin.id])[0]?.id;
       if (!winNodeId) {
+        const sid = sessionId();
         winNodeId = sqlInsert(
-          `INSERT INTO node (node_type, is_open, is_saved, chrome_id, win_rect, relicons) VALUES ('win',1,0,?,?,?)`,
-          [newWin.id, `${newWin.left}_${newWin.top}_${newWin.width}_${newWin.height}`, newWin.type ?? 'normal']
+          `INSERT INTO node (node_type, is_open, is_saved, chrome_id, win_rect, relicons, parent_id, order_by)
+           VALUES ('win',1,0,?,?,?,?,(SELECT COALESCE(MAX(order_by),-1)+1 FROM node WHERE parent_id=?))`,
+          [newWin.id, `${newWin.left}_${newWin.top}_${newWin.width}_${newWin.height}`, newWin.type ?? 'normal', sid, sid]
         );
       }
 
-      let pos = 0;
-      for (const t of openTabs) {
-        sqlRun(
-          `UPDATE node SET parent_id=?, position=?, order_by=?, updated_at=datetime('now') WHERE id=?`,
-          [winNodeId, pos, pos, t.id]
-        );
-        pos++;
+      const pairs = open.map(t => [t.id, t.chrome_id]);
+      let rest = saved;
+      if (!open.length && saved.length) {
+        pairs.push([saved[0].id, newWin.tabs[0].id]);
+        rest = saved.slice(1);
       }
-      if (openTabs.length === 0 && savedTabs.length) {
-        sqlRun(
-          `UPDATE node SET chrome_id=?, is_open=1, is_saved=0, parent_id=?, position=?, order_by=?, updated_at=datetime('now') WHERE id=?`,
-          [newWin.tabs[0].id, winNodeId, pos, pos, savedTabs[0].id]
-        );
-        pos++;
-        for (let i = 1; i < savedTabs.length; i++) {
-          const newTab = await chrome.tabs.create({ windowId: newWin.id, url: savedTabs[i].url, active: false });
-          bgState.adoptedTabIds.add(newTab.id);
-          sqlRun(
-            `UPDATE node SET chrome_id=?, is_open=1, is_saved=0, parent_id=?, position=?, order_by=?, updated_at=datetime('now') WHERE id=?`,
-            [newTab.id, winNodeId, pos, pos, savedTabs[i].id]
-          );
-          pos++;
-        }
-      } else {
-        for (const t of savedTabs) {
-          const newTab = await chrome.tabs.create({ windowId: newWin.id, url: t.url, active: false });
-          bgState.adoptedTabIds.add(newTab.id);
-          sqlRun(
-            `UPDATE node SET chrome_id=?, is_open=1, is_saved=0, parent_id=?, position=?, order_by=?, updated_at=datetime('now') WHERE id=?`,
-            [newTab.id, winNodeId, pos, pos, t.id]
-          );
-          pos++;
-        }
+      for (const t of rest) {
+        const nt = await chrome.tabs.create({ windowId: newWin.id, url: t.url, active: false });
+        bgState.adoptedTabIds.add(nt.id);
+        pairs.push([t.id, nt.id]);
       }
 
+      sqlExec(`DROP TABLE IF EXISTS tmp_open; CREATE TEMP TABLE tmp_open (node_id INTEGER PRIMARY KEY, chrome_id INTEGER, pos INTEGER);`);
+      sqlRun(
+        `INSERT INTO tmp_open VALUES ${pairs.map(() => '(?,?,?)').join(',')}`,
+        pairs.flatMap((p, i) => [p[0], p[1], i])
+      );
+      sqlExec(`
+        UPDATE node SET chrome_id=NULL, is_open=0, updated_at=datetime('now')
+          WHERE node_type='tab' AND chrome_id IN (SELECT chrome_id FROM tmp_open)
+            AND id NOT IN (SELECT node_id FROM tmp_open);
+        UPDATE node SET
+            chrome_id = (SELECT chrome_id FROM tmp_open o WHERE o.node_id = node.id),
+            position  = (SELECT pos       FROM tmp_open o WHERE o.node_id = node.id),
+            order_by  = (SELECT pos       FROM tmp_open o WHERE o.node_id = node.id),
+            parent_id = ${Math.trunc(+winNodeId)}, is_open=1, updated_at=datetime('now')
+          WHERE id IN (SELECT node_id FROM tmp_open);
+        DROP TABLE tmp_open;
+      `);
       await persistDb();
       return { ok: true, moved: tabs.length };
     }
 
     case 'save_close_search': {
       const { where, params } = buildSearchWhere(payload.q);
-      const tabs = sqlQuery(
-        `SELECT id, chrome_id, is_open FROM node WHERE (${where}) AND node_type='tab' AND url IS NOT NULL AND id NOT IN (SELECT DISTINCT parent_id FROM node WHERE parent_id IS NOT NULL) LIMIT 200`,
+      const rows = sqlQuery(
+        `SELECT id, chrome_id, is_open FROM node WHERE (${where}) AND ${LEAF_TABS} LIMIT 200`,
         params
       );
-      let count = 0;
-      for (const t of tabs) {
-        sqlRun(`UPDATE node SET is_saved=1, is_open=0, chrome_id=NULL, updated_at=datetime('now') WHERE id=?`, [t.id]);
-        if (t.is_open && t.chrome_id) { try { await chrome.tabs.remove(t.chrome_id); } catch {} }
-        count++;
-      }
+      if (!rows.length) return { ok: true, count: 0 };
+      sqlRun(
+        `UPDATE node SET is_saved=1, is_open=0, chrome_id=NULL, updated_at=datetime('now')
+         WHERE id IN (${rows.map(r => Math.trunc(+r.id)).join(',')})`
+      );
       await persistDb();
-      return { ok: true, count };
+      const closeIds = rows.filter(r => r.is_open && r.chrome_id).map(r => r.chrome_id);
+      if (closeIds.length) { try { await chrome.tabs.remove(closeIds); } catch {} }
+      return { ok: true, count: rows.length };
     }
 
     case 'close_search': {
       const { where, params } = buildSearchWhere(payload.q);
-      const tabs = sqlQuery(
-        `SELECT id, chrome_id FROM node WHERE (${where}) AND node_type='tab' AND is_open=1 AND url IS NOT NULL AND id NOT IN (SELECT DISTINCT parent_id FROM node WHERE parent_id IS NOT NULL) LIMIT 200`,
+      const rows = sqlQuery(
+        `SELECT chrome_id FROM node WHERE (${where}) AND ${LEAF_TABS} AND is_open=1 AND chrome_id IS NOT NULL LIMIT 200`,
         params
       );
-      let count = 0;
-      for (const t of tabs) {
-        if (t.chrome_id) { try { await chrome.tabs.remove(t.chrome_id); } catch {} }
-        count++;
-      }
-      return { ok: true, count };
+      if (rows.length) { try { await chrome.tabs.remove(rows.map(r => r.chrome_id)); } catch {} }
+      return { ok: true, count: rows.length };
     }
 
     // ── Config k/v ───────────────────────────────────────────────────────────
     case 'get_config': {
-      const rows = payload.key
-        ? sqlQuery('SELECT value FROM config WHERE key=?', [payload.key])
-        : sqlQuery('SELECT key, value FROM config');
-      if (payload.key) return { ok: true, value: rows[0]?.value ?? null };
-      const obj = {};
-      for (const r of rows) obj[r.key] = r.value;
-      return { ok: true, values: obj };
+      if (payload.key) {
+        return { ok: true, value: sqlQuery(`SELECT value FROM config WHERE key=?`, [payload.key])[0]?.value ?? null };
+      }
+      return { ok: true, values: Object.fromEntries(sqlQuery(`SELECT key, value FROM config`).map(r => [r.key, r.value])) };
     }
 
     case 'set_config': {
-      if (payload.key !== undefined) {
-        sqlRun('INSERT OR REPLACE INTO config (key, value) VALUES (?,?)', [payload.key, payload.value]);
-      } else if (payload.entries) {
-        for (const [k, v] of Object.entries(payload.entries)) {
-          sqlRun('INSERT OR REPLACE INTO config (key, value) VALUES (?,?)', [k, v]);
-        }
+      const entries = payload.key !== undefined ? { [payload.key]: payload.value } : (payload.entries ?? {});
+      const kv = Object.entries(entries);
+      if (kv.length) {
+        sqlRun(`INSERT OR REPLACE INTO config (key, value) VALUES ${kv.map(() => '(?,?)').join(',')}`, kv.flat());
       }
       await persistDb();
       return { ok: true };
@@ -458,13 +468,9 @@ async function handleMessage(cmd, payload) {
 
     // ── Schema info ──────────────────────────────────────────────────────────
     case 'get_schema': {
-      const tables = sqlQuery("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
-      const views  = sqlQuery("SELECT name FROM sqlite_master WHERE type='view'  ORDER BY name");
       const result = {};
-      for (const t of [...tables, ...views]) {
-        try {
-          result[t.name] = sqlQuery(`PRAGMA table_info(${t.name})`);
-        } catch {}
+      for (const t of sqlQuery(`SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY type, name`)) {
+        try { result[t.name] = sqlQuery(`PRAGMA table_info(${t.name})`); } catch {}
       }
       return { ok: true, schema: result };
     }

@@ -15,6 +15,7 @@ export const COLOR_VARS = [
   { prop: '--note-icon', label: 'Note icon',        def: '#a8dadc' },
   { prop: '--search-hl', label: 'Search highlight', def: '#5a4a00' },
   { prop: '--dup-url',   label: 'Duplicate URL',    def: '#f38ba8' },
+  { prop: '--saved-tab', label: 'Saved marker',     def: '#a6e3a1' },
   { prop: '--focus-bg',  label: 'Focus highlight',  def: '#1a3a5c' },
 ];
 
@@ -128,29 +129,32 @@ document.getElementById('cfg-export').addEventListener('click', async () => {
 
 // ── TabOutliner import ────────────────────────────────────────────────────────
 
+// Imported content is an archive: everything lands closed, and tabs/windows land
+// saved so the next resync's stale cleanup can never purge them. TabOutliner custom
+// title/favicon marks fold into the plain columns; 'separatorline' maps to 'split'.
 function parseTabOutlinerNode(raw) {
   let ntype = raw.type ?? 'tab';
   let is_saved = 0;
-  if (ntype === 'savedtab') { ntype = 'tab'; is_saved = 1; }
-  else if (ntype === 'savedwin') { ntype = 'win'; is_saved = 1; }
+  if      (ntype === 'savedtab')      { ntype = 'tab'; is_saved = 1; }
+  else if (ntype === 'savedwin')      { ntype = 'win'; is_saved = 1; }
+  else if (ntype === 'separatorline') { ntype = 'split'; }
+  if (ntype === 'tab' || ntype === 'win') is_saved = 1;
   const marks  = raw.marks ?? {};
   const data   = raw.data  ?? {};
   return {
-    node_type:      ntype,
+    node_type:    ntype,
     is_saved,
-    is_collapsed:   raw.colapsed ? 1 : 0,
-    is_open:        (ntype === 'win' || ntype === 'tab') && !is_saved ? 1 : 0,
-    title:          data.title        ?? null,
-    url:            data.url          ?? null,
-    favicon_url:    data.favIconUrl   ?? null,
-    note_text:      data.note         ?? null,
-    custom_title:   marks.customTitle       ?? null,
-    custom_favicon: marks.customFavicon     ?? null,
-    color_active:   marks.customColorActive ?? null,
-    color_saved:    marks.customColorSaved  ?? null,
-    relicons:       marks.relicons ? JSON.stringify(marks.relicons) : null,
-    win_rect:       data.rect ?? null,
-    chrome_id:      null,
+    is_collapsed: raw.colapsed ? 1 : 0,
+    is_open:      0,
+    title:        marks.customTitle   ?? data.title       ?? null,
+    url:          data.url            ?? null,
+    favicon_url:  marks.customFavicon ?? data.favIconUrl  ?? null,
+    note_text:    data.note           ?? null,
+    color_active: marks.customColorActive ?? null,
+    color_saved:  marks.customColorSaved  ?? null,
+    relicons:     marks.relicons ? JSON.stringify(marks.relicons) : null,
+    win_rect:     data.rect ?? null,
+    chrome_id:    null,
   };
 }
 
@@ -174,7 +178,8 @@ async function importTabOutliner(text) {
 
     const node = parseTabOutlinerNode(item[1]);
     node.parent_id = pathToId[parentKey] ?? null;
-    node.position  = posCounter[parentKey]++;
+    node.position  = posCounter[parentKey];
+    node.order_by  = posCounter[parentKey]++;
 
     const cleaned = Object.fromEntries(Object.entries(node).filter(([, v]) => v != null));
     const result  = await db.send('upsert_node', { node: cleaned });
@@ -185,15 +190,13 @@ async function importTabOutliner(text) {
 // ── TabOutliner export ────────────────────────────────────────────────────────
 
 async function exportTabOutliner() {
-  const r     = await db.query('SELECT * FROM node ORDER BY parent_id NULLS FIRST, position');
+  const r     = await db.query('SELECT * FROM node ORDER BY parent_id NULLS FIRST, order_by');
   const nodes = r?.rows ?? [];
 
   function toToNode(n) {
     const marks = {};
-    if (n.custom_title)   marks.customTitle        = n.custom_title;
-    if (n.custom_favicon) marks.customFavicon      = n.custom_favicon;
-    if (n.color_active)   marks.customColorActive  = n.color_active;
-    if (n.color_saved)    marks.customColorSaved   = n.color_saved;
+    if (n.color_active) marks.customColorActive = n.color_active;
+    if (n.color_saved)  marks.customColorSaved  = n.color_saved;
     if (n.relicons) { try { marks.relicons = JSON.parse(n.relicons); } catch {} }
     const data = {};
     if (n.title)       data.title      = n.title;
@@ -201,8 +204,9 @@ async function exportTabOutliner() {
     if (n.favicon_url) data.favIconUrl = n.favicon_url;
     if (n.note_text)   data.note       = n.note_text;
     if (n.win_rect)    data.rect       = n.win_rect;
-    const exportType = (n.node_type === 'win' && n.is_saved) ? 'savedwin'
-                     : (n.node_type === 'tab' && n.is_saved) ? 'savedtab'
+    const exportType = (n.node_type === 'win' && !n.is_open) ? 'savedwin'
+                     : (n.node_type === 'tab' && !n.is_open) ? 'savedtab'
+                     : n.node_type === 'split' ? 'separatorline'
                      : n.node_type;
     return { type: exportType, colapsed: !!n.is_collapsed, data, marks };
   }
@@ -211,7 +215,7 @@ async function exportTabOutliner() {
 
   function traverse(parentId, pathSoFar) {
     nodes.filter(n => n.parent_id == parentId)
-         .sort((a, b) => a.position - b.position)
+         .sort((a, b) => a.order_by - b.order_by)
          .forEach((n, i) => {
            const path = [...pathSoFar, i];
            result.push([TO_NODE_INSERT, toToNode(n), path]);
@@ -247,13 +251,14 @@ CREATE TABLE IF NOT EXISTS node (
   is_collapsed   INTEGER NOT NULL DEFAULT 0,
   is_open        INTEGER NOT NULL DEFAULT 0,
   is_saved       INTEGER NOT NULL DEFAULT 0,
+  is_pinned      INTEGER NOT NULL DEFAULT 0,
+  order_by       INTEGER NOT NULL DEFAULT 0,
   chrome_id      INTEGER DEFAULT NULL,
   title          TEXT,
   url            TEXT,
+  domain         TEXT,
   favicon_url    TEXT,
   note_text      TEXT,
-  custom_title   TEXT,
-  custom_favicon TEXT,
   color_active   TEXT,
   color_saved    TEXT,
   relicons       TEXT,
@@ -268,8 +273,8 @@ async function exportSQL() {
   const nodes = r?.rows ?? [];
 
   const cols = ['id','parent_id','node_type','position','is_collapsed','is_open','is_saved',
-                'chrome_id','title','url','favicon_url','note_text','custom_title',
-                'custom_favicon','color_active','color_saved','relicons','win_rect',
+                'is_pinned','order_by','chrome_id','title','url','domain','favicon_url',
+                'note_text','color_active','color_saved','relicons','win_rect',
                 'created_at','updated_at'];
 
   function sqlVal(v) {

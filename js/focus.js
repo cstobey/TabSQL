@@ -20,7 +20,7 @@ export function applyFocusHighlights() {
     if (node) treeEl.querySelector(`[data-id="${node.id}"]`)?.classList.add('focus-active');
   }
   if (state.focusState.focusedWinChromeId) {
-    const winNode = state.allNodes.find(n => n.node_type === 'win' && !n.is_saved && n.chrome_id === state.focusState.focusedWinChromeId);
+    const winNode = state.allNodes.find(n => n.node_type === 'win' && n.is_open && n.chrome_id === state.focusState.focusedWinChromeId);
     if (winNode) treeEl.querySelector(`[data-id="${winNode.id}"]`)?.classList.add('focus-active');
   }
 }

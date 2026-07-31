@@ -15,9 +15,10 @@ export const DEFAULT_QUICK_QUERIES = [
 
 // Shared mutable state accessed by both bg-db.js internals and bg-sync.js / background.js
 export const bgState = {
-  pendingAdopt:  null,
-  adoptedTabIds: new Set(),
-  movingTabIds:  new Map(), // chromeTabId → timestamp; 5s TTL prevents cascade re-entry
+  pendingAdopt:   null,
+  pendingWinAdopt: null,     // { nodeId, ts } — next onWindowCreated adopts this node
+  adoptedTabIds:  new Set(),
+  movingTabIds:   new Map(), // chromeTabId → timestamp; 5s TTL prevents cascade re-entry
 };
 
 let SQL     = null;
@@ -159,9 +160,9 @@ function applySchema() {
       SELECT w.id, w.node_type,
              COALESCE(w.title, 'Untitled') AS title,
              w.is_open, w.is_saved, w.is_collapsed, w.win_rect,
-             COUNT(t.id) AS tab_count, SUM(t.is_open) AS open_tab_count
+             COUNT(t.id) AS tab_count, COALESCE(SUM(t.is_open), 0) AS open_tab_count
       FROM node w
-      LEFT JOIN node t ON t.parent_id = w.id AND t.node_type = 'tab'
+      LEFT JOIN node_tree t ON t.win_node_id = w.id AND t.node_type = 'tab'
       WHERE w.node_type = 'win'
       GROUP BY w.id;
     CREATE TABLE IF NOT EXISTS quick_query (
@@ -209,22 +210,61 @@ function applySchema() {
     db.exec(`UPDATE node SET order_by = position`);
   } catch {}
 
+  // Single session root; every other root-level node hangs under it
+  db.exec(`
+    INSERT INTO node (node_type, title, order_by)
+    SELECT 'session', 'Session', 0 WHERE NOT EXISTS (SELECT 1 FROM node WHERE node_type='session');
+    UPDATE node SET parent_id=(SELECT id FROM node WHERE node_type='session')
+    WHERE parent_id IS NULL AND node_type!='session';
+  `);
+
   const count = sqlQuery('SELECT COUNT(*) c FROM quick_query')[0]?.c ?? 0;
   if (+count === 0) seedDefaultQueries();
 }
 
-// Returns [{id, chrome_id}] for all open, chrome-tracked descendants in order_by order (DFS)
+export function sessionId() {
+  return sqlQuery(`SELECT id FROM node WHERE node_type='session' LIMIT 1`)[0]?.id ?? null;
+}
+
+export function rowsModified() {
+  return db.getRowsModified();
+}
+
+export function cfgNum(key, def) {
+  const v = sqlQuery(`SELECT value FROM config WHERE key=?`, [key])[0]?.value;
+  return v != null && v !== '' && !isNaN(+v) ? +v : def;
+}
+
+// Re-pack order_by to 0..n-1 per parent (ties broken by id); pass parent ids to limit
+// scope. Ranks are materialized first because an UPDATE's correlated subqueries see
+// rows the same statement already modified.
+export function renumberOrderBy(parentIds = null) {
+  const ids = parentIds?.map(Number).filter(Number.isFinite);
+  const filter = ids?.length ? `WHERE parent_id IN (${ids.join(',')})` : '';
+  sqlExec(`
+    DROP TABLE IF EXISTS tmp_ord;
+    CREATE TEMP TABLE tmp_ord AS
+      SELECT id, ROW_NUMBER() OVER (PARTITION BY parent_id ORDER BY order_by, id) - 1 rk
+      FROM node ${filter};
+    UPDATE node SET order_by = (SELECT rk FROM tmp_ord WHERE tmp_ord.id = node.id)
+      WHERE id IN (SELECT id FROM tmp_ord);
+    DROP TABLE tmp_ord;
+  `);
+}
+
+// Returns [{id, chrome_id}] for all open, chrome-tracked descendants in DFS tree order
 export function getRecursiveOpenChildren(nodeId) {
-  const rows = sqlQuery(
-    `SELECT id, chrome_id FROM node WHERE parent_id=? AND is_open=1 AND chrome_id IS NOT NULL ORDER BY order_by`,
-    [nodeId]
-  );
-  const result = [];
-  for (const row of rows) {
-    result.push(row);
-    result.push(...getRecursiveOpenChildren(row.id));
-  }
-  return result;
+  return sqlQuery(`
+    WITH RECURSIVE d(id, chrome_id, is_open, node_type, path) AS (
+      SELECT id, chrome_id, is_open, node_type, printf('%08d', order_by) FROM node WHERE parent_id=?
+      UNION ALL
+      SELECT n.id, n.chrome_id, n.is_open, n.node_type, d.path || '/' || printf('%08d', n.order_by)
+      FROM node n JOIN d ON n.parent_id = d.id
+    )
+    SELECT id, chrome_id FROM d
+    WHERE is_open=1 AND chrome_id IS NOT NULL AND node_type='tab'
+    ORDER BY path
+  `, [nodeId]);
 }
 
 // Walks the parent chain to find the containing win node's chrome_id

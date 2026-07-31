@@ -1,19 +1,8 @@
-the focus is getting stuck, especially on double-click of a node
-the order_by is still being mangled some.
-on reload, nodes are getting duplicated. 
-reboot saved the tabs, but killed the window.
-
-to deal with these issues and cleanup the code some, we are going to add a recursive view that adds the following columns to the node table: 
-  win_node_id the node.id for any win that this node is a child of. 
-  group_node_id the node.id for any group that this node is a child of. 
-  level int starting at 1 for the top level, and incrementing for each nesting level
-This enables us to easily see both the flat view that chrome sees and the tree veiw we are using. 
-
-in onWindowRemoved, instead of looping over tabs, we can use the view to delete open tabs from the bottom up, setting all children of that node to its parent without worrying about nodes missing because we deleted the above node first. We can also use the win_node_id and group_node_ids to quickly determine if those nodes need to be saved or deleted. 
-
-
-add an option to export the SQL console statement output to csv.
-
-I want the frontend view to be based off of the SQL state so that if I manually run a mutation query, the view automatically gets updated. This also means that if I DELETE nodes that are open, they should be closed. You can get this data by adding a RETURNING clause to `DELETE node` statements that renders the chrome_id column so you close them in chrome. You have to handle the case where there already is a returning clause though and just make sure that the chrome_id is in the list of returned columns. anther option is to just run a resync, but the operations need to be slightly different if a mutation just happened, ie, a DELETE means that we should close tabs that we dont have in the database rather than add then to the database, and and update might mean that we pin tabs in chrome rather than update our db. basically, we are just flipping the source of truth between the 2 views. if we use the new recursive view, the the sync should be easier.
-
-
+after a computer restart, chrome can restore all the previously opened tabs and windows. When that happens I want the resync to find the previously opened tabs that correspond to the tabs that are now opened in Chrome. I dont want to lose the old tab's placement in the tree so new windows tabs might need to be used in place of the older tabs. since a restore can happen after initialization, when new tabs are added, we may need to see if the new tabs/windows are already present and roughly in the right place. I want best effort, but err on the side of duplication. 
+I prefer SQL over JS, so the backend loops I would like to replace with SQL statements. Batch operations with RETURNING clauses should be the norm. where multiple statements are excuted in sequence, put them in the same sqlExec call. I prefer dense code that is terse. SQL helps with that. If a snipet of code is complicated enough to warrent a comment, keep all comments for the function together to explain the high level all at once.
+I also prefer a functional style over imperative, so when there is an oppertunity to refactor something to be more functional, please do so.
+once a tab is saved, it sould stay saved unless manually closed. because of this, the `save on close` action rule should trigger whenever a tab is added or refreshed and just set the saved status at that time. The frontend should have a way to display that a tab is saved, probably with a default green circle prepending the node, like the defauld red circle for duplicates. dont forget to add the color to the configuration. I think this might be working, but I want it doublechecked and refactored to be SQL driven.
+the `move to window` action should move to a named window using the node_text. If such a window does not exist, one must be made. Once made, the window node should be saved, but not the chilren (at least not by default). 
+The delete action rule should also close the tab. verify this while you are refactoring.
+the action config layout isn't lined up very well, can you make it look prettier while maintaining the general aesthetic.
+While you refactor the codebase, try to find any bugs or inconsistentcies. In particular, I am worried about the node structure. We have 2 competing trees that need to be kept in sync: the chrome view of active tabs/windows/groups, and the TabSQL view of active and saved tabs/windows/groups. for example, when a node in the TabSQL view is moved, it and all its decendents must be moved in the chrome state (ie, the referer relatoinships should be maintained as much as possible). If a node is moved in the Chrome view, its descendence should not be moved and instead reassigned to the moved node's parent (their order_by would also need to be updated - I also want order_by maintained at each level, that is, WHERE parent_id is the same). 

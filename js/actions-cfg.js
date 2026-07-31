@@ -19,7 +19,7 @@ export async function loadCfgActions() {
     const tagName = cfg.tag_id ? (state.allTags.find(t => t.id === cfg.tag_id)?.name ?? '?') : '';
     const badgeText = r.action_type === 'add_tag'       ? `tag:${tagName}`
                     : r.action_type === 'delete'        ? `delete${cfg.delay_days ? ` (${cfg.delay_days}d)` : ''}`
-                    : r.action_type === 'move'          ? 'move'
+                    : r.action_type === 'move'          ? `move→${cfg.window_name ?? '#' + (cfg.target_win_id ?? '?')}`
                     : r.action_type === 'save_on_close' ? 'save-on-close'
                     : r.action_type;
     return `
@@ -74,11 +74,11 @@ function showActionEditor(existing) {
   const editorHtml = `
     <div class="action-editor" id="action-editor-form">
       <div class="action-editor-row">
-        <label>Name</label>
+        <label for="ae-name">Name</label>
         <input type="text" id="ae-name" value="${escHtml(existing?.name ?? '')}" placeholder="Action name">
       </div>
       <div class="action-editor-row">
-        <label>Type</label>
+        <label for="ae-type">Type</label>
         <select id="ae-type">
           <option value="add_tag"       ${existing?.action_type === 'add_tag'       ? 'selected' : ''}>Add tag</option>
           <option value="delete"        ${existing?.action_type === 'delete'        ? 'selected' : ''}>Delete</option>
@@ -87,34 +87,38 @@ function showActionEditor(existing) {
         </select>
       </div>
       <div class="action-editor-row" id="ae-tag-row">
-        <label>Tag</label>
+        <label for="ae-tag">Tag</label>
         <select id="ae-tag">${tagOpts}</select>
       </div>
       <div class="action-editor-row" id="ae-delay-row">
-        <label>Delay (days, 0=immediate)</label>
-        <input type="number" id="ae-delay" value="${cfg.delay_days ?? 0}" min="0">
+        <label for="ae-delay">Delay (days)</label>
+        <input type="number" id="ae-delay" value="${cfg.delay_days ?? 0}" min="0" title="0 = immediate">
       </div>
       <div class="action-editor-row" id="ae-win-row">
-        <label>Target window node ID</label>
-        <input type="number" id="ae-win" value="${cfg.target_win_id ?? ''}">
+        <label for="ae-win">Window name</label>
+        <input type="text" id="ae-win" value="${escHtml(cfg.window_name ?? '')}" placeholder="Created as saved window if missing">
       </div>
       <div class="action-editor-row">
-        <label>Condition type</label>
+        <label for="ae-cond-type">Condition</label>
         <select id="ae-cond-type">
           <option value="search" ${existing?.condition_type !== 'sql' ? 'selected' : ''}>Search string</option>
           <option value="sql"    ${existing?.condition_type === 'sql'  ? 'selected' : ''}>SQL query</option>
         </select>
       </div>
-      <div>
-        <label>Condition</label>
-        <textarea id="ae-condition" placeholder="Search terms or SQL SELECT…">${escHtml(existing?.condition ?? '')}</textarea>
+      <div class="action-editor-row">
+        <label></label>
+        <textarea id="ae-condition" placeholder="Search terms, or SQL SELECT returning node ids…">${escHtml(existing?.condition ?? '')}</textarea>
       </div>
       <div class="action-editor-row">
-        <label><input type="checkbox" id="ae-auto" ${existing?.is_auto ? 'checked' : ''}> Run automatically</label>
+        <label></label>
+        <label class="ae-inline"><input type="checkbox" id="ae-auto" ${existing?.is_auto ? 'checked' : ''}> Run automatically</label>
       </div>
       <div class="action-editor-row">
-        <button class="btn" id="ae-save">Save</button>
-        <button class="btn" id="ae-cancel">Cancel</button>
+        <label></label>
+        <span class="ae-btns">
+          <button class="btn" id="ae-save">Save</button>
+          <button class="btn" id="ae-cancel">Cancel</button>
+        </span>
       </div>
     </div>`;
 
@@ -145,7 +149,11 @@ function showActionEditor(existing) {
     const cfgObj = {};
     if (type === 'add_tag') cfgObj.tag_id = +document.getElementById('ae-tag').value;
     if (type === 'delete')  cfgObj.delay_days = +document.getElementById('ae-delay').value;
-    if (type === 'move')    cfgObj.target_win_id = +document.getElementById('ae-win').value;
+    if (type === 'move') {
+      const wn = document.getElementById('ae-win').value.trim();
+      if (wn) cfgObj.window_name = wn;
+      else if (cfg.target_win_id) cfgObj.target_win_id = cfg.target_win_id;
+    }
     await db.send('save_action_rule', {
       id: existing?.id,
       name, action_type: type, condition_type: condType, condition,

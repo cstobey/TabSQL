@@ -14,9 +14,9 @@ Chrome extension (Manifest V3) that manages browser tabs in a persistent tree vi
 | `manifest.json` | Extension manifest. Background type `"module"`. Permissions: `tabs`, `tabGroups`, `windows`, `storage`, `unlimitedStorage`, `clipboardWrite`. |
 | `sql-wasm.js` / `sql-wasm.wasm` | sql.js library — SQLite compiled to WASM. Exports `initSqlJs`. |
 | `js/common.js` | Shared pure logic used by both the service worker and the sidebar: `parseSearchTerms`. No DOM, Chrome API, or SQL dependencies. |
-| `js/bg-db.js` | DB init, schema (`applySchema`), persistence, SQL helpers (`sqlQuery`, `sqlRun`, `sqlInsert`, `sqlExec`), `upsertNode`, `buildSearchWhere`, `bgState`. |
-| `js/bg-rules.js` | `executeActionRule` — runs a single action rule against the DB. |
-| `js/bg-sync.js` | Chrome event handlers (`onTab*`, `onWindow*`, `onTabGroup*`), `resync`, `initialize`, `updateBadge`, `upsertTabGroup`. |
+| `js/bg-db.js` | DB init, schema (`applySchema`), persistence, SQL helpers (`sqlQuery`, `sqlRun`, `sqlInsert`, `sqlExec`, `rowsModified`), `buildSearchWhere`, `renumberOrderBy`, `sessionId`, `cfgNum`, `getRecursiveOpenChildren`, `getWinChromeId`, `bgState`. |
+| `js/bg-rules.js` | Rule engine: `executeActionRule` (batch SQL per action via `tmp_rule_match`), `applyAutoSaveRules` (per-node save_on_close at tab add/refresh). |
+| `js/bg-sync.js` | Chrome event handlers (`onTab*`, `onWindow*`, `onTabGroup*`), `resync`, `initialize`, `adoptWindows`/`mergeWindow`/`scheduleAdoption` (restore adoption), `chromeReparentTab`, `cascadeChildrenToChrome`, `updateBadge`, `upsertTabGroup`. |
 | `js/bg-popup.js` | `openOrFocusPopup`, `onBoundsChanged` (saves popup geometry to config), toolbar/command listeners. |
 | `js/state.js` | Exports a single `state` object holding all shared mutable UI state. |
 | `js/db-api.js` | Exports `db` — the sidebar-side message wrapper (`db.send`, `db.query`, etc.). |
@@ -37,11 +37,13 @@ Chrome extension (Manifest V3) that manages browser tabs in a persistent tree vi
 id            INTEGER PK AUTOINCREMENT
 parent_id     INTEGER → node(id)
 node_type     TEXT  -- 'win' | 'tab' | 'group' | 'textnote' | 'session' | 'split'
-position      INTEGER
+position      INTEGER  -- Chrome tab index (mirror of live Chrome state)
 is_collapsed  INTEGER (0/1)
-is_open       INTEGER (0/1)
-is_saved      INTEGER (0/1)  -- 1 = saved/closed (replaces old savedwin/savedtab node_type values)
-chrome_id     INTEGER  -- Chrome window/tab/tabGroup ID; NULL when is_saved=1; unique per (node_type, chrome_id)
+is_open       INTEGER (0/1)  -- live in Chrome right now (chrome_id set)
+is_saved      INTEGER (0/1)  -- sticky "keep this node" flag, ORTHOGONAL to is_open
+is_pinned     INTEGER (0/1)
+order_by      INTEGER  -- sibling order in the tree; kept packed 0..n-1 per parent_id
+chrome_id     INTEGER  -- Chrome window/tab/tabGroup ID; NULL when is_open=0; unique per (node_type, chrome_id)
 title         TEXT
 url           TEXT
 domain        TEXT  -- hostname extracted from url, auto-populated by upsertNode
@@ -55,9 +57,11 @@ created_at    TEXT  -- datetime('now')
 updated_at    TEXT  -- datetime('now')
 ```
 
-`domain` is auto-populated by `extractDomain(url)` in `upsertNode` whenever `url` is set. Migrated for existing rows in `applySchema()`.
+`domain` is auto-populated by `extractDomain(url)` whenever `url` is set.
 
-`is_saved`: distinguishes open vs saved state without needing separate node_type values. `win + is_saved=0` = open window, `win + is_saved=1` = saved/closed window. Same for `tab`. Old `savedtab`/`savedwin` rows are auto-migrated on startup.
+**`is_saved` is orthogonal to `is_open`** — a tab can be open AND saved at once (shown with a green `.saved-dot`). `is_saved` means "keep this node": closing a saved tab/window keeps the row in place (`is_open=0, chrome_id=NULL`, parent/order untouched); closing an unsaved tab deletes the row and splices its children onto its parent. Only tree-side delete removes a saved node. Auto `save_on_close` rules set `is_saved` when a tab is created or its url/title changes — never at close time. Reopening a saved node keeps `is_saved=1`.
+
+A single `session` root node is guaranteed by `applySchema()`; every other root-level node is reparented under it. `order_by` is renumbered (`renumberOrderBy` in bg-db.js, two-phase via temp table) after any structural mutation.
 
 ### Views
 - `tab_flat` — all tab nodes joined with their parent info
@@ -96,6 +100,7 @@ value TEXT
 Used keys:
 - `color_--<css-prop>` — one entry per CSS custom property (e.g. `color_--bg`, `color_--accent`). Written on any color change; read at load to restore the theme.
 - `popup_width`, `popup_height`, `popup_left`, `popup_top` — popup window geometry, updated by `chrome.windows.onBoundsChanged`, applied when opening a new popup.
+- `adopt_candidate_hours` (default 48) — how recently a window must have been open/saved to qualify as a restore-adoption candidate.
 
 ### `win_auto_tag` table
 When a tag is registered here for a window node, `onTabCreated` automatically inserts into `node_tag` for every new tab opened in that window.
@@ -112,31 +117,43 @@ id             INTEGER PK AUTOINCREMENT
 name           TEXT
 action_type    TEXT  -- 'add_tag' | 'delete' | 'move' | 'save_on_close'
 condition_type TEXT  -- 'search' | 'sql'
-condition      TEXT  -- search string or SQL SELECT
-config         TEXT  -- JSON: {tag_id?, delay_days?, target_win_id?}
+condition      TEXT  -- search string or SQL SELECT returning node ids
+config         TEXT  -- JSON: {tag_id?, delay_days?, window_name?, target_win_id? (legacy)}
 is_auto        INTEGER (0/1)
 position       INTEGER
 created_at     TEXT
 ```
 
-`save_on_close`: when `is_auto=1`, any tab closed whose node matches the condition is saved (`is_saved=1`) instead of deleted. Running the rule manually saves and closes all matching open tabs.
+The engine (`bg-rules.js`) fills TEMP TABLE `tmp_rule_match(id)` from the condition, then each action is a batch statement:
+- `save_on_close`: marks matching open tabs `is_saved=1` — no closing. Auto rules also run per-node (`applyAutoSaveRules`) on tab create and url/title change, so saved status is set while the tab is still open; `onTabRemoved` just honors the flag.
+- `delete`: after the `delay_days` age gate, deletes the matched subtrees (recursive CTE, like `delete_node`) and closes any open Chrome tabs/windows they contained. Rows are deleted before the Chrome close so the resulting events no-op.
+- `move`: resolves `config.window_name` to a win node by title, creating it as a saved closed window under the session root when absent. Matched tabs reparent under it (relative order kept, appended); each moved tab's descendants splice onto its former parent. If a moved tab is open and the target window is closed, the window is reopened around that tab via `chrome.windows.create({tabId})` (its own saved children stay closed) and remaining open tabs are chrome-moved in.
+- `add_tag`: single `INSERT OR IGNORE ... SELECT`.
 
 ## Node types
 
 | Type | Meaning |
 |---|---|
-| `session` | Root node — single top-level container |
-| `win` | Chrome window — `is_saved=0` when open (`chrome_id` set, `is_open=1`), `is_saved=1` when closed/saved |
-| `tab` | Chrome tab — `is_saved=0` when open (`chrome_id` set, `is_open=1`), `is_saved=1` when saved/closed |
+| `session` | Root node — single top-level container, guaranteed to exist; all windows parent under it |
+| `win` | Chrome window — `is_open=1` + `chrome_id` while live; `is_open=0` when closed (kept only if saved or holding saved/textnote content) |
+| `tab` | Chrome tab — `is_open=1` + `chrome_id` while live; `is_saved=1` marks it sticky regardless of open state |
 | `group` | Chrome tab group — `chrome_id` = tabGroup.id, parent = win node, children = tab nodes. Also used as user-defined folders when `chrome_id` is NULL. |
-| `textnote` | Freeform text note |
+| `textnote` | Freeform text note — counts as keep-worthy content when deciding whether a closing window survives |
 | `split` | Visual divider (formerly `separatorline`). Chrome split-view tracking not implemented (no extension API). |
 
 ## Module structure
 
 `background.js` is an ES module MV3 service worker (`"type": "module"` in manifest). It imports from `js/bg-*.js` and `js/common.js`. Each `bg-*.js` file exports the functions it provides; event listeners in `bg-sync.js` and `bg-popup.js` register as side effects of import. `handleMessage` (the big switch) and the `onMessage` listener live in `background.js` itself.
 
-Shared mutable service-worker state (`pendingAdopt`, `adoptedTabIds`) lives in `bgState` exported from `js/bg-db.js` and imported by `bg-sync.js` and `background.js`.
+Shared mutable service-worker state (`pendingAdopt`, `pendingWinAdopt`, `adoptedTabIds`, `movingTabIds`) lives in `bgState` exported from `js/bg-db.js` and imported by `bg-rules.js`, `bg-sync.js` and `background.js`.
+
+### The two-tree sync contract
+
+Chrome's live tabs/windows/groups and the TabSQL tree are reconciled with an asymmetric rule:
+- **TabSQL-initiated moves** (`move_node`, drag in the tree) move the node AND its open descendants in Chrome (`cascadeChildrenToChrome`, DFS via recursive CTE) — referer relationships are preserved.
+- **Chrome-initiated moves** (tab-strip drag → `onMoved`, cross-window drag → `onDetached`/`onAttached`, group membership change → `onUpdated.groupId`) reparent ONLY the moved node (`chromeReparentTab`): its children splice onto its former parent, and the node lands under the group/window Chrome reports at the order slot implied by its tab index.
+- `movingTabIds` (5s TTL) marks our own programmatic `chrome.tabs.move` calls so their echo events only refresh `position` instead of re-reparenting. `onDetached` must never consume the sentinel — the following `onAttached` needs it.
+- Divergence is legal: a tab node may live under a closed window in the tree while its Chrome tab is open elsewhere. Close paths skip nodes whose `chrome_id` is still live in another window.
 
 `tree.js` is an ES module entry point. It imports all sidebar sub-modules (which register their own event listeners as side effects on import) then runs the boot sequence. Shared mutable state lives in `js/state.js` as a single exported `state` object; all modules import and mutate it directly.
 
@@ -172,16 +189,22 @@ function upsertNode(node) {
 Safe to call with `{ id, note_text: val }` — won't clobber other fields.
 
 ### pendingAdopt — open a saved tab without creating a duplicate node
-When tree.js wants to re-open a saved tab, it calls `pre_open_tab` BEFORE `chrome.tabs.create`. `onTabCreated` then checks `pendingAdopt` (5s TTL) and updates the existing node's `chrome_id` instead of inserting a new row.
+When tree.js wants to re-open a saved tab, it calls `pre_open_tab` BEFORE `chrome.tabs.create`. `onTabCreated` then checks `pendingAdopt` (5s TTL) and grafts the chrome identity onto the existing node in place — parent, order_by and is_saved untouched.
 
-### adoptedTabIds — bulk window reopen
-`open_saved_window` handler opens all tabs via `chrome.windows.create`, matches them 1:1 to saved tab nodes, and adds all Chrome tab IDs to `adoptedTabIds`. `onTabCreated` skips any ID in this set.
+### pendingWinAdopt — reopen a window node without a duplicate win row
+Set before any `chrome.windows.create` that should bind to an EXISTING win node (`open_saved_window`, move-rule reopen). `onWindowCreated` consumes it (5s TTL, single-shot) instead of inserting a fresh win node — closes the race between the create() promise and the event.
 
-### chrome_id dedup in initialize()
-`upsertWin` and `upsertTab` look up existing nodes by `chrome_id` first. If found, they pass `id` into `upsertNode` (UPDATE path) without changing `parent_id`. This prevents duplicates when the service worker restarts.
+### adoptedTabIds — bulk tab reopen
+Handlers that open tabs for existing nodes (`open_saved_window`, `open_search_in_window`) add the new Chrome tab IDs to `adoptedTabIds`; `onTabCreated` skips any ID in this set.
+
+### Restore adoption (restart / session-restore recovery)
+Chrome reuses small integer ids across restarts, so `initialize()` detects a new browser session via a `chrome.storage.session` marker (cleared on restart) and NULLs every stored `chrome_id` first. `resync()` then inserts the restored windows as fresh nodes and `adoptWindows()` merges them back: fresh windows (node created < 3 min ago) are scored against candidates (stale-open, or closed-saved within `adopt_candidate_hours`) by URL-multiset overlap of their tabs; a merge needs ≥ half the fresh tabs matched (err toward duplication) and pairing is greedy best-score, unique both sides. `mergeWindow` grafts chrome ids onto the old nodes — tabs pair by (url, rank), groups by (title, rank) — so tree placement survives; unpaired fresh children reparent under the adopted window. The same adoption runs debounced (`scheduleAdoption`, 1.5s) after tab/window creation bursts for post-boot restores, and `onTabCreated` silently re-attaches a single restored tab to a recently saved same-URL node under the same window (Ctrl+Shift+T).
+
+### resync stale cleanup
+Open nodes no longer present in Chrome: saved tabs close in place; unsaved stale tabs and stale groups are deleted with survivors spliced up to the nearest kept ancestor (`spliceOutDoomed`, one-hop loop); stale windows survive (promoted to `is_saved=1`) only when holding saved or textnote content. `resync` never touches `parent_id`, `order_by`, or `is_saved` of matched nodes.
 
 ### save_on_close action rule
-`onTabRemoved` checks `is_auto=1` rules with `action_type='save_on_close'` before deleting a tab node. If the closed tab matches any rule's condition, the node is updated to `is_saved=1, is_open=0, chrome_id=NULL` instead of being deleted.
+Evaluated when a tab is CREATED or its url/title changes (`applyAutoSaveRules`), setting `is_saved=1` while the tab is open. `onTabRemoved` does no rule matching — it just keeps saved nodes and deletes unsaved ones.
 
 ## Message protocol (background.js ↔ tree.js)
 
@@ -190,13 +213,13 @@ All messages: `{ to: 'background', cmd, payload }` → response `{ ok, data }` o
 | cmd | payload | returns |
 |---|---|---|
 | `bulk_exec` | `{ sql }` | `{ rows }` |
-| `upsert_node` | `{ node }` | `{ id }` |
-| `delete_node` | `{ id }` | cascade-deletes all descendants + node_tag/win_auto_tag cleanup |
-| `move_node` | `{ id, parent_id, position }` | — |
-| `search` | `{ q }` | `{ rows }` — supports field-prefix syntax |
+| `upsert_node` | `{ node }` | `{ id }` — inserts default `parent_id` to the session root |
+| `delete_node` | `{ id }` | cascade-deletes all descendants + node_tag/win_auto_tag cleanup (recursive CTE, one exec) |
+| `move_node` | `{ id, parent_id, order_by }` | TabSQL-side move: chrome-moves the tab and cascades open descendants |
+| `search` | `{ q }` | `{ matchedCount, visibleIds }` — supports field-prefix syntax |
 | `pre_open_tab` | `{ nodeId, url }` | sets pendingAdopt |
-| `open_saved_window` | `{ winNodeId }` | opens all saved tab children in new window, adopts existing nodes |
-| `save_window` | `{ winNodeId }` | marks all open tabs as saved, then closes the Chrome window |
+| `open_saved_window` | `{ winNodeId }` | reopens all saved descendant tabs (DFS order) into a new window; nodes keep is_saved=1 |
+| `save_window` | `{ winNodeId }` | marks win + all descendant tabs saved, then closes the Chrome window |
 | `open_search_in_window` | `{ q }` | moves matching leaf tab nodes to a new window (moves open tabs via chrome.tabs.move, opens fresh for saved tabs reusing existing nodes) |
 | `save_close_search` | `{ q }` | saves and closes all matching leaf tab nodes |
 | `close_search` | `{ q }` | closes (discards) all matching open leaf tab nodes |
@@ -248,6 +271,9 @@ const db = {
 ### Duplicate URL indicator
 `dupUrls` Set is computed in `load()` and after any delete. Duplicate nodes show a colored circle (`.dup-dot`) prepended before the icon, colored `--dup-url`.
 
+### Saved indicator
+Saved tabs/windows show a green circle (`.saved-dot`, colored `--saved-tab`) before the icon, whether open or closed. Icons key off `is_open` (`⬤`/`·`, `🪟`/`📁`). The context menu has "Toggle saved"; the 💾 button marks saved then closes (the sticky flag keeps the node).
+
 ### Drag-to-dedent
 Mouse X position relative to tree → `hoverLevel = floor((mouseX - 4) / 16)`. If `hoverLevel < nodeLevel`, walk up ancestors `(nodeLevel - hoverLevel)` steps to find effective parent.
 
@@ -262,7 +288,8 @@ Debounced `load()` call (600ms) triggered by Chrome tab/window events and after 
 
 ## CSS conventions (index.html)
 
-- CSS custom properties in `:root`: `--bg`, `--surface`, `--border`, `--accent`, `--text`, `--muted`, `--hover`, `--win-icon`, `--tab-icon`, `--focus-bg`, `--dup-url`, `--indent` (16px), `--row-h` (28px)
+- CSS custom properties in `:root`: `--bg`, `--surface`, `--border`, `--accent`, `--text`, `--muted`, `--hover`, `--win-icon`, `--tab-icon`, `--focus-bg`, `--dup-url`, `--saved-tab`, `--indent` (16px), `--row-h` (28px)
+- `.action-editor` is a two-column grid (`max-content 1fr`); `.action-editor-row` uses `display: contents` so rows can still be hidden with inline `display: none`
 - `.node` rows use `padding-left: (depth * 16 + 4)px` for indentation — not nested divs
 - `.actions` hidden by default, shown on `.node:hover`
 - `.node.open-tab .label` → tab-icon color for open tabs
@@ -290,5 +317,8 @@ Debounced `load()` call (600ms) triggered by Chrome tab/window events and after 
 
 - Bash sandbox is broken in this environment — use Read/Edit/Write tools directly
 - sql.js WASM requires `'wasm-unsafe-eval'` in the extension's CSP (already in manifest.json)
-- Service workers are terminated by Chrome when idle and restart on next event — `initialize()` must be idempotent (chrome_id dedup handles this)
+- The code assumes the bundled SQLite supports window functions (≥3.25) and `RETURNING` (≥3.35)
+- SQLite gotcha: correlated subqueries in an UPDATE see rows the same statement already modified — snapshot ranks into a temp table first (see `renumberOrderBy`)
+- sql.js `bind` takes EITHER a positional array or an all-named object (`:name`) — never mix `?` with named params in one statement
+- Service workers are terminated by Chrome when idle and restart on next event — `initialize()` must be idempotent; a `chrome.storage.session` marker distinguishes SW restarts (chrome_ids valid) from browser restarts (all chrome_ids invalid, nulled before resync)
 - `chrome.storage.local` holds the serialized DB as a plain array; exported via `db.export()` on every write

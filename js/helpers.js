@@ -11,8 +11,8 @@ export function setStatus(msg) {
 
 export function nodeIcon(n) {
   switch(n.node_type) {
-    case 'win':          return n.is_saved ? '📁' : (n.relicons === 'popup' ? '🔲' : '🪟');
-    case 'tab':          return n.is_saved ? '·' : '⬤';
+    case 'win':          return n.is_open ? (n.relicons === 'popup' ? '🔲' : '🪟') : '📁';
+    case 'tab':          return n.is_open ? '⬤' : '·';
     case 'textnote':     return '📝';
     case 'split':        return '—';
     case 'group':        return '▸';

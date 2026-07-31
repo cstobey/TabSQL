@@ -72,8 +72,10 @@ export function buildTree(parentId = null, depth = 0, searchOpts = null) {
     const noteText  = n.note_text || '';
     const noteHtml  = searchOpts ? highlightText(noteText, searchOpts.q) : escHtml(noteText);
     const isDup     = n.url && state.dupUrls.has(n.url);
-    const dupIndicator  = isDup       ? `<span class="dup-dot" title="Duplicate URL"></span>` : '';
-    const pinIndicator  = n.is_pinned ? `<span class="pin-indicator" title="Pinned">📌</span>` : '';
+    const dupIndicator   = isDup       ? `<span class="dup-dot" title="Duplicate URL"></span>` : '';
+    const savedIndicator = n.is_saved && (isTab || n.node_type === 'win')
+      ? `<span class="saved-dot" title="Saved"></span>` : '';
+    const pinIndicator   = n.is_pinned ? `<span class="pin-indicator" title="Pinned">📌</span>` : '';
 
     const nodeTags = state.nodeTagsMap[n.id] ?? [];
     const tagChipsHtml = nodeTags.length
@@ -83,9 +85,9 @@ export function buildTree(parentId = null, depth = 0, searchOpts = null) {
       : '';
 
     const editBtn = `<button class="act act-edit" data-id="${n.id}" title="Edit note">✎</button>`;
-    const saveBtn = (n.node_type === 'tab' && !n.is_saved)
+    const saveBtn = (n.node_type === 'tab' && isOpen)
       ? `<button class="act act-save" data-id="${n.id}" title="Save &amp; close">💾</button>`
-      : (n.node_type === 'win' && !n.is_saved)
+      : (n.node_type === 'win' && isOpen)
         ? `<button class="act act-save-win" data-id="${n.id}" title="Save &amp; close window">💾</button>`
         : '';
     const pinBtn  = (n.node_type === 'tab' && n.is_open)
@@ -108,6 +110,7 @@ export function buildTree(parentId = null, depth = 0, searchOpts = null) {
                  draggable="true"
                  style="padding-left:${indent + 4}px" title="${escHtml(n.url || '')}">
               ${toggle}
+              ${savedIndicator}
               ${dupIndicator}
               ${pinIndicator}
               ${faviconHtml || `<span class="icon">${icon}</span>`}
