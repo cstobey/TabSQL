@@ -93,7 +93,9 @@ export function buildTree(parentId = null, depth = 0, searchOpts = null) {
     const pinBtn  = (n.node_type === 'tab' && n.is_open)
       ? `<button class="act act-pin" data-id="${n.id}" title="${n.is_pinned ? 'Unpin' : 'Pin'}">📌</button>`
       : '';
-    const delBtn  = `<button class="act act-del" data-id="${n.id}" title="Delete">✕</button>`;
+    const delBtn  = n.node_type !== 'session'
+      ? `<button class="act act-del" data-id="${n.id}" title="Delete">✕</button>`
+      : '';
     const actions = `<span class="actions">${editBtn}${pinBtn}${saveBtn}${delBtn}</span>`;
     const noteRow = `<div class="note-row${noteText ? '' : ' empty'}" data-note-for="${n.id}"
                          style="padding-left:${indent + 20}px">
@@ -107,7 +109,7 @@ export function buildTree(parentId = null, depth = 0, searchOpts = null) {
     const kidHtml = hasKids && !isColl ? buildTree(n.id, depth + 1, searchOpts) : '';
 
     return `<div class="${cls}" data-id="${n.id}" data-type="${n.node_type}"
-                 draggable="true"
+                 draggable="${n.node_type !== 'session'}"
                  style="padding-left:${indent + 4}px" title="${escHtml(n.url || '')}">
               ${toggle}
               ${savedIndicator}
@@ -137,8 +139,7 @@ export async function render(nodes, filter = '') {
     const matchedCount = r?.matchedCount ?? 0;
     const visibleIds = new Set(r?.visibleIds ?? []);
 
-    const session = state.allNodes.find(n => n.node_type === 'session');
-    treeEl.innerHTML = buildTree(session ? session.id : null, 0, { visibleIds, q: filter });
+    treeEl.innerHTML = buildTree(null, 0, { visibleIds, q: filter });
     setStatus(`${matchedCount} result${matchedCount !== 1 ? 's' : ''}`);
     searchWinBtn.style.display   = matchedCount ? '' : 'none';
     tagSearchBtn.style.display   = matchedCount ? '' : 'none';
@@ -151,7 +152,6 @@ export async function render(nodes, filter = '') {
   tagSearchBtn.style.display   = 'none';
   saveSearchBtn.style.display  = 'none';
   closeSearchBtn.style.display = 'none';
-  const session = state.allNodes.find(n => n.node_type === 'session');
-  treeEl.innerHTML = buildTree(session ? session.id : null, 0);
+  treeEl.innerHTML = buildTree(null, 0);
   applyFocusHighlights();
 }

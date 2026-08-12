@@ -135,6 +135,7 @@ treeEl.addEventListener('click', async e => {
 // so the resulting Chrome events find nothing; tabs close before the window so an
 // emptied window closes itself and the windows.remove is just a fallback.
 async function deleteSubtree(n) {
+  if (n.node_type === 'session') { setStatus('Cannot delete the session root'); return; }
   const descIds = allDescendantIds(n.id);
   const closeTabs = [...descIds].map(d => state.nodeMap[d])
     .filter(x => x?.node_type === 'tab' && x.is_open && x.chrome_id)

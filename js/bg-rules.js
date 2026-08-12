@@ -167,26 +167,23 @@ export async function executeActionRule(rule) {
   return count;
 }
 
-// TODO item 4: saved status is set the moment a tab matches, while still open.
-// Called on tab create and on url/title refresh; is_saved=0 guard makes it idempotent.
-export function applyAutoSaveRules(nodeId) {
-  for (const rule of sqlQuery(`SELECT * FROM action_rule WHERE action_type='save_on_close' AND is_auto=1`)) {
+// Runs every is_auto rule against ONE node — called on tab create and on url/title
+// refresh, so auto rules fire as tabs appear/change instead of only via "run all".
+// The match set is narrowed to nodeId so each action's batch SQL touches nothing else;
+// save_on_close therefore marks the tab while it is still open. Stops early if an
+// action (delete/move) removed the node.
+export async function applyAutoRules(nodeId) {
+  let count = 0;
+  for (const rule of sqlQuery(`SELECT * FROM action_rule WHERE is_auto=1 ORDER BY position, id`)) {
+    if (!matchRule(rule)) continue;
+    sqlRun(`DELETE FROM tmp_rule_match WHERE id IS NOT ?`, [nodeId]);
+    if (!sqlQuery(`SELECT COUNT(*) c FROM tmp_rule_match`)[0].c) continue;
     try {
-      if (rule.condition_type === 'search') {
-        const { where, params } = buildSearchWhere(rule.condition);
-        sqlRun(
-          `UPDATE node SET is_saved=1, updated_at=datetime('now') WHERE id=? AND node_type='tab' AND is_saved=0 AND (${where})`,
-          [nodeId, ...params]
-        );
-      } else {
-        sqlRun(
-          `UPDATE node SET is_saved=1, updated_at=datetime('now')
-           WHERE id=? AND node_type='tab' AND is_saved=0 AND id IN (SELECT id FROM (${bareSql(rule.condition)}))`,
-          [nodeId]
-        );
-      }
-      if (rowsModified()) return 1;
+      const cfg = rule.config ? JSON.parse(rule.config) : {};
+      count += ACTIONS[rule.action_type] ? await ACTIONS[rule.action_type](cfg) : 0;
     } catch {}
+    if (!sqlQuery(`SELECT 1 FROM node WHERE id=?`, [nodeId]).length) break;
   }
-  return 0;
+  sqlExec(`DROP TABLE IF EXISTS tmp_rule_match`);
+  return count;
 }

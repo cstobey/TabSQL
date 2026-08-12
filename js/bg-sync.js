@@ -3,7 +3,7 @@ import {
   extractDomain, bgState, getRecursiveOpenChildren, getWinChromeId,
   sessionId, renumberOrderBy, rowsModified, cfgNum,
 } from './bg-db.js';
-import { applyAutoSaveRules } from './bg-rules.js';
+import { applyAutoRules } from './bg-rules.js';
 
 function nodeDbId(chromeId, type) {
   return sqlQuery(
@@ -493,7 +493,7 @@ async function onWindowRemoved(winId) {
 //   silent adopt   — a recently saved, closed tab with the same URL under this same
 //                    window: Ctrl+Shift+T style restores re-attach instead of duplicating
 // New nodes parent to their opener tab, else their group, else the parent of the
-// preceding tab, else the window; auto-save rules and window auto-tags apply to them.
+// preceding tab, else the window; window auto-tags then all is_auto rules apply to them.
 async function onTabCreated(tab) {
   await ensureDb();
 
@@ -567,7 +567,6 @@ async function onTabCreated(tab) {
     );
   }
 
-  applyAutoSaveRules(newTabId);
   if (winNodeId != null) {
     sqlRun(
       `INSERT OR IGNORE INTO node_tag (node_id, tag_id) SELECT ?, tag_id FROM win_auto_tag WHERE win_node_id=?`,
@@ -577,6 +576,7 @@ async function onTabCreated(tab) {
       scheduleAdoption();
     }
   }
+  await applyAutoRules(newTabId);
   await syncWindowPositions(tab.windowId);
   await persistDb();
   await updateBadge();
@@ -661,7 +661,7 @@ async function onTabUpdated(tabId, changeInfo, tab) {
       `UPDATE node SET title=?, url=?, domain=?, favicon_url=?, updated_at=datetime('now') WHERE id=?`,
       [tab.title ?? '', url, extractDomain(url), tab.favIconUrl ?? '', id]
     );
-    if (changeInfo.url || changeInfo.title) applyAutoSaveRules(id);
+    if (changeInfo.url || changeInfo.title) await applyAutoRules(id);
   }
   await persistDb();
 }

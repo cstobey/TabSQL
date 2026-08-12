@@ -6,3 +6,7 @@ the `move to window` action should move to a named window using the node_text. I
 The delete action rule should also close the tab. verify this while you are refactoring.
 the action config layout isn't lined up very well, can you make it look prettier while maintaining the general aesthetic.
 While you refactor the codebase, try to find any bugs or inconsistentcies. In particular, I am worried about the node structure. We have 2 competing trees that need to be kept in sync: the chrome view of active tabs/windows/groups, and the TabSQL view of active and saved tabs/windows/groups. for example, when a node in the TabSQL view is moved, it and all its decendents must be moved in the chrome state (ie, the referer relatoinships should be maintained as much as possible). If a node is moved in the Chrome view, its descendence should not be moved and instead reassigned to the moved node's parent (their order_by would also need to be updated - I also want order_by maintained at each level, that is, WHERE parent_id is the same). 
+
+
+All node_types need to be visible in the tree view. Right now, the Sessions are not. 
+

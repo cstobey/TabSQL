@@ -15,7 +15,7 @@ Chrome extension (Manifest V3) that manages browser tabs in a persistent tree vi
 | `sql-wasm.js` / `sql-wasm.wasm` | sql.js library — SQLite compiled to WASM. Exports `initSqlJs`. |
 | `js/common.js` | Shared pure logic used by both the service worker and the sidebar: `parseSearchTerms`. No DOM, Chrome API, or SQL dependencies. |
 | `js/bg-db.js` | DB init, schema (`applySchema`), persistence, SQL helpers (`sqlQuery`, `sqlRun`, `sqlInsert`, `sqlExec`, `rowsModified`), `buildSearchWhere`, `renumberOrderBy`, `sessionId`, `cfgNum`, `getRecursiveOpenChildren`, `getWinChromeId`, `bgState`. |
-| `js/bg-rules.js` | Rule engine: `executeActionRule` (batch SQL per action via `tmp_rule_match`), `applyAutoSaveRules` (per-node save_on_close at tab add/refresh). |
+| `js/bg-rules.js` | Rule engine: `executeActionRule` (batch SQL per action via `tmp_rule_match`), `applyAutoRules` (all `is_auto` rules against one node at tab add/refresh). |
 | `js/bg-sync.js` | Chrome event handlers (`onTab*`, `onWindow*`, `onTabGroup*`), `resync`, `initialize`, `adoptWindows`/`mergeWindow`/`scheduleAdoption` (restore adoption), `chromeReparentTab`, `cascadeChildrenToChrome`, `updateBadge`, `upsertTabGroup`. |
 | `js/bg-popup.js` | `openOrFocusPopup`, `onBoundsChanged` (saves popup geometry to config), toolbar/command listeners. |
 | `js/state.js` | Exports a single `state` object holding all shared mutable UI state. |
@@ -125,7 +125,9 @@ created_at     TEXT
 ```
 
 The engine (`bg-rules.js`) fills TEMP TABLE `tmp_rule_match(id)` from the condition, then each action is a batch statement:
-- `save_on_close`: marks matching open tabs `is_saved=1` — no closing. Auto rules also run per-node (`applyAutoSaveRules`) on tab create and url/title change, so saved status is set while the tab is still open; `onTabRemoved` just honors the flag.
+- `save_on_close`: marks matching open tabs `is_saved=1` — no closing. `onTabRemoved` just honors the flag.
+
+Every `is_auto` rule (any action type) also runs per-node via `applyAutoRules(nodeId)` on tab create and url/title change: the match set is narrowed to that one node, so each action's batch SQL touches only it. The loop stops early if an action (delete/move) removed the node. `run_auto_actions` still runs the same rules across the whole tree on demand.
 - `delete`: after the `delay_days` age gate, deletes the matched subtrees (recursive CTE, like `delete_node`) and closes any open Chrome tabs/windows they contained. Rows are deleted before the Chrome close so the resulting events no-op.
 - `move`: resolves `config.window_name` to a win node by title, creating it as a saved closed window under the session root when absent. Matched tabs reparent under it (relative order kept, appended); each moved tab's descendants splice onto its former parent. If a moved tab is open and the target window is closed, the window is reopened around that tab via `chrome.windows.create({tabId})` (its own saved children stay closed) and remaining open tabs are chrome-moved in.
 - `add_tag`: single `INSERT OR IGNORE ... SELECT`.
@@ -203,8 +205,8 @@ Chrome reuses small integer ids across restarts, so `initialize()` detects a new
 ### resync stale cleanup
 Open nodes no longer present in Chrome: saved tabs close in place; unsaved stale tabs and stale groups are deleted with survivors spliced up to the nearest kept ancestor (`spliceOutDoomed`, one-hop loop); stale windows survive (promoted to `is_saved=1`) only when holding saved or textnote content. `resync` never touches `parent_id`, `order_by`, or `is_saved` of matched nodes.
 
-### save_on_close action rule
-Evaluated when a tab is CREATED or its url/title changes (`applyAutoSaveRules`), setting `is_saved=1` while the tab is open. `onTabRemoved` does no rule matching — it just keeps saved nodes and deletes unsaved ones.
+### auto action rules
+All `is_auto=1` rules are evaluated against the affected node when a tab is CREATED or its url/title changes (`applyAutoRules`) — `save_on_close` sets `is_saved=1` while the tab is still open, `add_tag`/`move`/`delete` act immediately. `onTabRemoved` does no rule matching — it just keeps saved nodes and deletes unsaved ones.
 
 ## Message protocol (background.js ↔ tree.js)
 
