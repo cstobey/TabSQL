@@ -13,6 +13,8 @@ Chrome extension (Manifest V3) that manages browser tabs in a persistent tree vi
 | `index.html` | Sidebar shell — all CSS lives here. Loads `tree.js` as `type="module"`. |
 | `manifest.json` | Extension manifest. Background type `"module"`. Permissions: `tabs`, `tabGroups`, `windows`, `storage`, `unlimitedStorage`, `clipboardWrite`. |
 | `sql-wasm.js` / `sql-wasm.wasm` | sql.js library — SQLite compiled to WASM. Exports `initSqlJs`. |
+| `lib/codemirror.js` | Vendored CodeMirror 6 bundle (committed). Built by `npm install && npm run build:cm` from `scripts/codemirror.entry.js` (a re-export list — add an export there when `js/sql-editor.js` needs a new CM symbol, then rebuild). Upstream CM moved off GitHub to code.haverbeke.berlin; npm packages are still current. |
+| `js/sql-editor.js` | `createSqlEditor(parent, { onRun, placeholderText })` — CodeMirror SQL editor (SQLite dialect, theme via CSS vars, Tab = accept/open completion, Mod-Enter = run). Returns a textarea-like `{ value, focus, setSchema }`. |
 | `js/common.js` | Shared pure logic used by both the service worker and the sidebar: `parseSearchTerms`. No DOM, Chrome API, or SQL dependencies. |
 | `js/bg-db.js` | DB init, schema (`applySchema`), persistence, SQL helpers (`sqlQuery`, `sqlRun`, `sqlInsert`, `sqlExec`, `rowsModified`), `buildSearchWhere`, `renumberOrderBy`, `NEXT_ROOT_ORDER`, `cfgNum`, `getRecursiveOpenChildren`, `getWinChromeId`, `bgState`. |
 | `js/bg-rules.js` | Rule engine: `executeActionRule` (batch SQL per action via `tmp_rule_match`), `applyAutoRules` (all `is_auto` rules against one node at tab add/refresh), `chromeMoveIntoWin` (chrome-move open tabs into a win node, reopening it around the first tab if closed). |
@@ -24,7 +26,7 @@ Chrome extension (Manifest V3) that manages browser tabs in a persistent tree vi
 | `js/focus.js` | `syncFocusState`, `applyFocusHighlights`. |
 | `js/render.js` | `buildTree`, `render`, `load`, `loadTags`. |
 | `js/events.js` | All DOM event listeners: tree clicks, action buttons, context menu, drag/drop, search, toolbar, live Chrome events, config section expand/collapse. |
-| `js/sql-panel.js` | SQL panel: `loadQuickQueries`, `runSQL`, save/delete/restore query buttons, resize handle, schema popup. |
+| `js/sql-panel.js` | SQL panel: `sqlEditor` instance, `loadSqlSchema` (feeds completion from `get_schema`; reloaded after non-SELECT statements), `loadQuickQueries`, `runSQL`, ⧩ Filter, save/delete/restore query buttons, resize handle, schema popup. |
 | `js/config.js` | `loadTheme`, `buildColorGrid`, color reset, `loadDateFormat`/date-format input, import/export (TabOutliner + SQL). |
 | `js/tags.js` | Tag picker overlay, `loadCfgTags`, config tags panel, `btn-tag-search` handler. |
 | `js/actions-cfg.js` | `loadCfgActions`, `showActionEditor`, config actions panel. |
@@ -103,6 +105,7 @@ Used keys:
 - `color_--<css-prop>` — one entry per CSS custom property (e.g. `color_--bg`, `color_--accent`). Written on any color change; read at load to restore the theme.
 - `popup_width`, `popup_height`, `popup_left`, `popup_top` — popup window geometry, updated by `chrome.windows.onBoundsChanged`, applied when opening a new popup.
 - `date_format` (default `MM-DD h:mm A`) — template for the tree's updated_at column; tokens `YYYY YY MM DD HH H hh h mm ss A a` (`formatDate` in helpers.js); `''` hides the column. `applyDateFormat` in config.js sizes `--date-w` from it.
+- `sql_editor_height` — px height of the SQL editor container (`#sql-input`, native CSS `resize: vertical` grip), saved by a ResizeObserver in sql-panel.js.
 - `adopt_candidate_hours` (default 24) — how far back from the newest `updated_at` older than one hour a saved closed window must have changed to qualify as a restore-adoption candidate; also the plain now-relative window for single-tab silent re-attach.
 
 ### `win_auto_tag` table

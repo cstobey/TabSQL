@@ -1,9 +1,40 @@
 import { db } from './db-api.js';
 import { escHtml, setStatus } from './helpers.js';
 import { load } from './render.js';
+import { createSqlEditor } from './sql-editor.js';
 
 export const sqlQuickEl = document.getElementById('sql-quick');
 let sqlLastRows  = [];
+
+export const sqlEditor = createSqlEditor(document.getElementById('sql-input'), {
+  placeholderText: 'SELECT * FROM node LIMIT 20;  -- Ctrl+Enter to run, Tab to complete',
+  onRun: () => { const sql = sqlEditor.value.trim(); if (sql) runSQL(sql); },
+});
+
+// Editor height comes from the native CSS resize grip; persisted as sql_editor_height.
+// The observer's initial callback reports the restored height, so unchanged sizes
+// aren't re-saved.
+const sqlInputEl = document.getElementById('sql-input');
+let editorH = null, editorHTimer = null;
+db.send('get_config', { key: 'sql_editor_height' }).then(r => {
+  if (r?.value) { editorH = +r.value; sqlInputEl.style.height = `${editorH}px`; }
+}).catch(console.error).finally(() => {
+  editorH ??= Math.round(sqlInputEl.getBoundingClientRect().height);
+  new ResizeObserver(() => {
+    const h = Math.round(sqlInputEl.getBoundingClientRect().height);
+    if (!h || h === editorH) return;
+    editorH = h;
+    clearTimeout(editorHTimer);
+    editorHTimer = setTimeout(() => db.send('set_config', { key: 'sql_editor_height', value: String(h) }), 500);
+  }).observe(sqlInputEl);
+});
+
+export async function loadSqlSchema() {
+  const r = await db.send('get_schema');
+  sqlEditor.setSchema(Object.fromEntries(
+    Object.entries(r?.schema ?? {}).map(([name, cols]) => [name, (cols ?? []).map(c => c.name)])
+  ));
+}
 
 export async function loadQuickQueries() {
   const r    = await db.send('get_quick_queries');
@@ -31,7 +62,7 @@ export async function runSQL(sql) {
     sqlLastRows = rows;
     renderSqlTable(rows);
     statusEl.textContent = `${rows.length} row${rows.length !== 1 ? 's' : ''} · ${elapsed}ms`;
-    if (!/^\s*SELECT/i.test(sql)) load();
+    if (!/^\s*SELECT/i.test(sql)) { load(); loadSqlSchema().catch(console.error); }
   } catch(e) {
     resultsEl.innerHTML = `<div style="color:var(--red);padding:8px;font-size:12px">Error: ${escHtml(e.message)}</div>`;
     statusEl.textContent = 'Error';
@@ -63,14 +94,14 @@ function renderSqlTable(rows) {
 sqlQuickEl.addEventListener('change', () => {
   const opt = sqlQuickEl.options[sqlQuickEl.selectedIndex];
   if (!opt?.dataset.sql) return;
-  document.getElementById('sql-input').value = opt.dataset.sql;
+  sqlEditor.value = opt.dataset.sql;
   runSQL(opt.dataset.sql);
 });
 
 // ── Save current query ────────────────────────────────────────────────────────
 
 document.getElementById('sql-save-query').addEventListener('click', async () => {
-  const sql = document.getElementById('sql-input').value.trim();
+  const sql = sqlEditor.value.trim();
   if (!sql) return;
 
   const selOpt  = sqlQuickEl.options[sqlQuickEl.selectedIndex];
@@ -123,7 +154,7 @@ document.getElementById('sql-restore-defaults').addEventListener('click', async 
 // ── Run / keyboard ────────────────────────────────────────────────────────────
 
 document.getElementById('sql-run').addEventListener('click', () => {
-  const sql = document.getElementById('sql-input').value.trim();
+  const sql = sqlEditor.value.trim();
   if (sql) runSQL(sql);
 });
 
@@ -150,13 +181,6 @@ document.getElementById('sql-export-csv').addEventListener('click', () => {
   const a    = Object.assign(document.createElement('a'), { href: url, download: 'query-results.csv' });
   a.click();
   URL.revokeObjectURL(url);
-});
-
-document.getElementById('sql-input').addEventListener('keydown', e => {
-  if (e.ctrlKey && e.key === 'Enter') {
-    const sql = e.target.value.trim();
-    if (sql) runSQL(sql);
-  }
 });
 
 // ── SQL panel resize ──────────────────────────────────────────────────────────
