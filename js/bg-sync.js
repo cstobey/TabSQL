@@ -1,7 +1,7 @@
 import {
   ensureDb, persistDb, sqlQuery, sqlRun, sqlInsert, sqlExec,
   extractDomain, bgState, getRecursiveOpenChildren, getWinChromeId,
-  sessionId, renumberOrderBy, rowsModified, cfgNum,
+  renumberOrderBy, rowsModified, cfgNum, NEXT_ROOT_ORDER,
 } from './bg-db.js';
 import { applyAutoRules } from './bg-rules.js';
 
@@ -60,7 +60,8 @@ export async function cascadeChildrenToChrome(nodeId, startIndex, windowId) {
 // they splice onto its former parent. The node itself reparents to the group/window
 // Chrome now reports and lands at the order slot implied by its new tab index — the
 // fractional order_by drops it between its Chrome-order neighbors and the renumber
-// pass makes it integral again.
+// pass makes it integral again. updated_at is explicit: a user drag counts as a change
+// even when only order_by moved.
 async function chromeReparentTab(tabChromeId) {
   const node = sqlQuery(
     `SELECT id, parent_id FROM node WHERE node_type='tab' AND chrome_id=? LIMIT 1`,
@@ -81,7 +82,7 @@ async function chromeReparentTab(tabChromeId) {
     WHERE id=:id`,
     { ':pid': newPid, ':id': node.id, ':idx': tab.index }
   );
-  renumberOrderBy([node.parent_id, newPid].filter(p => p != null));
+  renumberOrderBy([node.parent_id, newPid]);
 }
 
 // ── resync ────────────────────────────────────────────────────────────────────
@@ -90,7 +91,7 @@ async function chromeReparentTab(tabChromeId) {
 //   1. snapshot Chrome into tmp_node and match rows by (chrome_id, node_type)
 //   2. update matched nodes in place — parent_id, order_by and is_saved are never
 //      touched, so tree placement and the sticky saved flag survive
-//   3. insert unmatched Chrome objects as new nodes (windows under the session root)
+//   3. insert unmatched Chrome objects as new nodes (windows at the root level)
 //   4. adoptWindows() merges just-inserted duplicate windows into nodes that were
 //      open recently (restart / session-restore recovery), then tmp ids re-match
 //   5. open nodes no longer present in Chrome: saved ones (and windows holding
@@ -168,15 +169,12 @@ export async function resync() {
       favicon_url  = COALESCE((SELECT t.favicon_url  FROM tmp_node t WHERE t.id = node.id), node.favicon_url),
       color_active = COALESCE((SELECT t.color_active FROM tmp_node t WHERE t.id = node.id), node.color_active),
       relicons     = COALESCE((SELECT t.relicons     FROM tmp_node t WHERE t.id = node.id), node.relicons),
-      win_rect     = COALESCE((SELECT t.win_rect     FROM tmp_node t WHERE t.id = node.id), node.win_rect),
-      updated_at   = datetime('now')
+      win_rect     = COALESCE((SELECT t.win_rect     FROM tmp_node t WHERE t.id = node.id), node.win_rect)
     WHERE id IN (SELECT id FROM tmp_node WHERE id IS NOT NULL);
 
     INSERT INTO node (chrome_id, node_type, is_open, is_saved, relicons, win_rect, parent_id, order_by, updated_at)
-    SELECT t.chrome_id, 'win', 1, 0, t.relicons, t.win_rect,
-           (SELECT id FROM node WHERE node_type='session'),
-           (SELECT COALESCE(MAX(n2.order_by),-1)+1 FROM node n2
-             WHERE n2.parent_id = (SELECT id FROM node WHERE node_type='session')) + ROW_NUMBER() OVER (ORDER BY t.chrome_id) - 1,
+    SELECT t.chrome_id, 'win', 1, 0, t.relicons, t.win_rect, NULL,
+           ${NEXT_ROOT_ORDER} + ROW_NUMBER() OVER (ORDER BY t.chrome_id) - 1,
            datetime('now')
     FROM tmp_node t WHERE t.id IS NULL AND t.node_type = 'win';
     ${rematch} WHERE id IS NULL;
@@ -224,7 +222,7 @@ export async function resync() {
   `);
   spliceOutDoomed();
   sqlExec(`
-    UPDATE node SET is_open=0, chrome_id=NULL, updated_at=datetime('now')
+    UPDATE node SET is_open=0, chrome_id=NULL
       WHERE is_open=1 AND id IN (SELECT id FROM tmp_stale);
     UPDATE node SET is_saved=1
       WHERE is_saved=0 AND id IN (SELECT id FROM tmp_stale WHERE node_type='win');
@@ -265,14 +263,9 @@ export function scheduleAdoption() {
   }, 1500);
 }
 
-// Matches freshly-created live windows (node created < 3 min ago) against windows
-// that were open recently — stale-open leftovers from before a restart, or windows
-// closed+saved within adopt_candidate_hours (config, default 48h). Score is the
-// URL-multiset overlap between the fresh window's open tabs and the candidate's
-// non-live tabs; a merge needs at least half the fresh tabs matched (low confidence
-// errs toward duplication). Greedy best-score pairing, unique on both sides.
-export async function adoptWindows() {
-  const hours = cfgNum('adopt_candidate_hours', 48);
+// Snapshot of live Chrome ids (kind 'win' | 'tab' | 'grp') into TEMP TABLE tmp_live;
+// callers drop it when done.
+async function fillLiveTable() {
   const [liveWins, liveTabs, liveGroups] = await Promise.all([
     chrome.windows.getAll({}), chrome.tabs.query({}), chrome.tabGroups.query({}),
   ]);
@@ -283,6 +276,26 @@ export async function adoptWindows() {
     ...liveGroups.map(g => [g.id, 'grp']),
   ];
   if (liveRows.length) sqlRun(`INSERT INTO tmp_live VALUES ${liveRows.map(() => '(?,?)').join(',')}`, liveRows.flat());
+}
+
+// COALESCE because `NULL IN (...)` is NULL, which would poison a NOT
+const isLive = kind => `(is_open=1 AND COALESCE(chrome_id IN (SELECT chrome_id FROM tmp_live WHERE kind='${kind}'), 0))`;
+
+// Matches freshly-created live windows (node created < 3 min ago) against windows
+// that were open recently — stale-open leftovers from before a restart, or saved
+// closed windows changed within adopt_candidate_hours (config, default 24h) of the
+// newest activity older than an hour. Anchoring there rather than at now means the
+// restore's own row churn is ignored and a browser left closed for days still finds
+// its windows. Score is the URL-multiset overlap between the fresh window's open tabs
+// and the candidate's non-live tabs; a merge needs at least half the fresh tabs
+// matched (low confidence errs toward duplication). Greedy best-score pairing,
+// unique on both sides.
+export async function adoptWindows() {
+  const hours = cfgNum('adopt_candidate_hours', 24);
+  await fillLiveTable();
+  const { cut } = sqlQuery(`
+    SELECT COALESCE(datetime(MAX(updated_at), :h), datetime('now', :h)) cut
+    FROM node WHERE updated_at < datetime('now', '-1 hour')`, { ':h': `-${hours} hours` })[0];
 
   const pairs = sqlQuery(`
     WITH fresh_tab AS (
@@ -300,7 +313,7 @@ export async function adoptWindows() {
         AND (t.is_open=0 OR t.chrome_id IS NULL OR t.chrome_id NOT IN (SELECT chrome_id FROM tmp_live WHERE kind='tab'))
         AND w.created_at < datetime('now','-3 minutes')
         AND ((w.is_open=1 AND (w.chrome_id IS NULL OR w.chrome_id NOT IN (SELECT chrome_id FROM tmp_live WHERE kind='win')))
-          OR (w.is_open=0 AND w.is_saved=1 AND w.updated_at >= datetime('now', :cut)))
+          OR (w.is_open=0 AND w.is_saved=1 AND w.updated_at >= :cut))
       GROUP BY 1, 2
     ),
     fresh_size AS (SELECT wid, SUM(cnt) total FROM fresh_tab GROUP BY wid)
@@ -309,37 +322,80 @@ export async function adoptWindows() {
     GROUP BY 1, 2
     HAVING SUM(MIN(f.cnt, c.cnt)) * 2 >= fs.total
     ORDER BY matches DESC, fresh_id, cand_id
-  `, { ':cut': `-${hours} hours` });
+  `, { ':cut': cut });
 
   const usedF = new Set(), usedC = new Set();
   let merged = 0;
   for (const p of pairs) {
     if (usedF.has(p.fresh_id) || usedC.has(p.cand_id)) continue;
     usedF.add(p.fresh_id); usedC.add(p.cand_id);
-    mergeWindow(p.fresh_id, p.cand_id);
+    mergeWindow(p.fresh_id, p.cand_id, true);
     merged++;
   }
   sqlExec(`DROP TABLE IF EXISTS tmp_live`);
   return merged;
 }
 
-// Grafts the fresh window's Chrome identity onto the candidate node so tree placement
-// survives: fresh tabs pair to candidate tabs by (url, rank) and fresh groups to
-// candidate groups by (title, rank); paired fresh nodes die and their chrome ids move
-// onto the old nodes; unpaired fresh children reparent under the candidate; finally
-// the fresh win node disappears and the candidate reopens under its chrome_id.
-function mergeWindow(freshId, candId) {
-  const f = Math.trunc(+freshId), c = Math.trunc(+candId);
+// Manual-resync cleanup. A window whose every distinct tab URL also appears in ONE
+// other window is redundant and merges into it. Blank/new-tab URLs are ignored so an
+// empty new window can't claim (and reopen) some saved window. When two windows cover each other,
+// the one with the deeper nesting survives (then more tabs, then the older id). Two
+// live windows are never merged — that would mean closing a Chrome window. One merge
+// per pass with the weakest redundant window first, recomputed after each merge
+// because a merge changes the URL sets.
+export async function dedupeWindows() {
+  await fillLiveTable();
+  let merged = 0;
+  for (;;) {
+    const p = sqlQuery(`
+      WITH wt AS (SELECT DISTINCT win_node_id wid, url FROM node_tree
+                  WHERE node_type='tab' AND url NOT IN ('', 'chrome://newtab/', 'about:blank')
+                    AND win_node_id IS NOT NULL),
+      ws AS (SELECT wid, COUNT(*) n FROM wt GROUP BY wid),
+      wd AS (SELECT t.win_node_id wid, MAX(t.level) - w.level depth
+             FROM node_tree t JOIN node_tree w ON w.id = t.win_node_id GROUP BY t.win_node_id),
+      wl AS (SELECT id wid, ${isLive('win')} live FROM node WHERE node_type='win')
+      SELECT a.wid AS drop_id, b.wid AS keep_id, la.live AS drop_live
+      FROM wt a JOIN wt b ON b.url = a.url AND b.wid != a.wid
+      JOIN ws sa ON sa.wid = a.wid JOIN ws sb ON sb.wid = b.wid
+      JOIN wd da ON da.wid = a.wid JOIN wd db ON db.wid = b.wid
+      JOIN wl la ON la.wid = a.wid JOIN wl lb ON lb.wid = b.wid
+      WHERE NOT (la.live AND lb.live)
+      GROUP BY a.wid, b.wid
+      HAVING COUNT(*) = sa.n
+         AND (sb.n > sa.n OR (sb.n = sa.n AND (db.depth, -b.wid) > (da.depth, -a.wid)))
+      ORDER BY sa.n, da.depth, a.wid DESC, db.depth DESC, sb.n DESC, b.wid
+      LIMIT 1`)[0];
+    if (!p) break;
+    mergeWindow(p.drop_id, p.keep_id, !!p.drop_live);
+    merged++;
+  }
+  sqlExec(`DROP TABLE IF EXISTS tmp_live`);
+  return merged;
+}
+
+// Merges window `fromId` into `intoId` so the into-node's tree placement survives.
+// Tabs pair by (url, rank), groups by (title, rank). Paired from-nodes die: tags,
+// saved flags and notes carry over, and when the from-window is live its Chrome
+// identity grafts onto the into-nodes (only non-live into-nodes are eligible then; a
+// closed from-window offers only its non-live nodes, so divergent live tabs stay
+// tracked). Unpaired from-children reparent under intoId, the from win node
+// disappears, and a live from-window's chrome_id moves onto intoId.
+// Requires TEMP TABLE tmp_live.
+function mergeWindow(fromId, intoId, fromLive) {
+  const f = Math.trunc(+fromId), c = Math.trunc(+intoId);
+  const fromSide = kind => fromLive ? isLive(kind) : `NOT ${isLive(kind)}`;
+  const intoSide = kind => fromLive ? `NOT ${isLive(kind)}` : '1';
   sqlExec(`
     DROP TABLE IF EXISTS tmp_pairs;
     CREATE TEMP TABLE tmp_pairs AS
-    SELECT fr.id fresh_id, ca.id cand_id, fr.chrome_id, fr.position, fr.is_pinned, fr.title, fr.favicon_url
-    FROM (SELECT id, url, chrome_id, position, is_pinned, title, favicon_url,
-                 ROW_NUMBER() OVER (PARTITION BY url ORDER BY position, id) rn
-          FROM node_tree WHERE win_node_id=${f} AND node_type='tab' AND is_open=1 AND url != '') fr
+    SELECT fr.id fresh_id, ca.id cand_id, fr.chrome_id, fr.position, fr.is_pinned, fr.title, fr.favicon_url,
+           fr.is_saved, fr.note_text
+    FROM (SELECT id, url, chrome_id, position, is_pinned, title, favicon_url, is_saved, note_text,
+                 ROW_NUMBER() OVER (PARTITION BY url ORDER BY position, order_by, id) rn
+          FROM node_tree WHERE win_node_id=${f} AND node_type='tab' AND url != '' AND ${fromSide('tab')}) fr
     JOIN (SELECT id, url, ROW_NUMBER() OVER (PARTITION BY url ORDER BY order_by, id) rn
-          FROM node_tree WHERE win_node_id=${c} AND node_type='tab' AND url != ''
-            AND (is_open=0 OR chrome_id IS NULL OR chrome_id NOT IN (SELECT chrome_id FROM tmp_live WHERE kind='tab'))
+          FROM node_tree WHERE win_node_id=${c} AND node_type='tab' AND url != '' AND ${intoSide('tab')}
          ) ca ON ca.url = fr.url AND ca.rn = fr.rn;
 
     DROP TABLE IF EXISTS tmp_gpairs;
@@ -347,10 +403,9 @@ function mergeWindow(freshId, candId) {
     SELECT fr.id fresh_id, ca.id cand_id, fr.chrome_id, fr.color_active, fr.is_collapsed
     FROM (SELECT id, title, chrome_id, color_active, is_collapsed,
                  ROW_NUMBER() OVER (PARTITION BY title ORDER BY order_by, id) rn
-          FROM node_tree WHERE win_node_id=${f} AND node_type='group' AND is_open=1) fr
+          FROM node_tree WHERE win_node_id=${f} AND node_type='group' AND ${fromSide('grp')}) fr
     JOIN (SELECT id, title, ROW_NUMBER() OVER (PARTITION BY title ORDER BY order_by, id) rn
-          FROM node_tree WHERE win_node_id=${c} AND node_type='group'
-            AND (chrome_id IS NULL OR chrome_id NOT IN (SELECT chrome_id FROM tmp_live WHERE kind='grp'))
+          FROM node_tree WHERE win_node_id=${c} AND node_type='group' AND ${intoSide('grp')}
          ) ca ON ca.title IS fr.title AND ca.rn = fr.rn;
 
     INSERT OR IGNORE INTO node_tag (node_id, tag_id)
@@ -360,28 +415,34 @@ function mergeWindow(freshId, candId) {
     CREATE TEMP TABLE tmp_doomed AS
       SELECT fresh_id id FROM tmp_pairs UNION SELECT fresh_id FROM tmp_gpairs;
   `);
+  // From-nodes die before any graft: (node_type, chrome_id) is unique
   spliceOutDoomed();
   const base = sqlQuery(`SELECT COALESCE(MAX(order_by),-1)+1 b FROM node WHERE parent_id=?`, [c])[0].b;
   const fw = sqlQuery(`SELECT chrome_id, win_rect, relicons FROM node WHERE id=${f}`)[0] ?? {};
   sqlExec(`
+    UPDATE node SET
+      is_saved  = MAX(is_saved, (SELECT is_saved FROM tmp_pairs p WHERE p.cand_id = node.id)),
+      note_text = COALESCE(note_text, (SELECT note_text FROM tmp_pairs p WHERE p.cand_id = node.id))
+    WHERE id IN (SELECT cand_id FROM tmp_pairs);
+  `);
+  if (fromLive) sqlExec(`
     UPDATE node SET
       chrome_id   = (SELECT chrome_id FROM tmp_pairs p WHERE p.cand_id = node.id),
       is_open     = 1,
       position    = (SELECT position  FROM tmp_pairs p WHERE p.cand_id = node.id),
       is_pinned   = (SELECT is_pinned FROM tmp_pairs p WHERE p.cand_id = node.id),
       title       = COALESCE((SELECT title       FROM tmp_pairs p WHERE p.cand_id = node.id), title),
-      favicon_url = COALESCE((SELECT favicon_url FROM tmp_pairs p WHERE p.cand_id = node.id), favicon_url),
-      updated_at  = datetime('now')
+      favicon_url = COALESCE((SELECT favicon_url FROM tmp_pairs p WHERE p.cand_id = node.id), favicon_url)
     WHERE id IN (SELECT cand_id FROM tmp_pairs);
 
     UPDATE node SET
       chrome_id    = (SELECT chrome_id    FROM tmp_gpairs p WHERE p.cand_id = node.id),
       is_open      = 1,
       color_active = COALESCE((SELECT color_active FROM tmp_gpairs p WHERE p.cand_id = node.id), color_active),
-      is_collapsed = COALESCE((SELECT is_collapsed FROM tmp_gpairs p WHERE p.cand_id = node.id), is_collapsed),
-      updated_at   = datetime('now')
+      is_collapsed = COALESCE((SELECT is_collapsed FROM tmp_gpairs p WHERE p.cand_id = node.id), is_collapsed)
     WHERE id IN (SELECT cand_id FROM tmp_gpairs);
-
+  `);
+  sqlExec(`
     UPDATE node SET parent_id=${c}, order_by = order_by + ${Math.trunc(+base)} WHERE parent_id=${f};
 
     INSERT OR IGNORE INTO win_auto_tag (win_node_id, tag_id)
@@ -392,8 +453,8 @@ function mergeWindow(freshId, candId) {
     DROP TABLE tmp_pairs;
     DROP TABLE tmp_gpairs;
   `);
-  sqlRun(
-    `UPDATE node SET is_open=1, chrome_id=?, win_rect=COALESCE(?, win_rect), relicons=COALESCE(?, relicons), updated_at=datetime('now')
+  if (fromLive) sqlRun(
+    `UPDATE node SET is_open=1, chrome_id=?, win_rect=COALESCE(?, win_rect), relicons=COALESCE(?, relicons)
      WHERE id=?`,
     [fw.chrome_id ?? null, fw.win_rect ?? null, fw.relicons ?? null, c]
   );
@@ -424,7 +485,7 @@ async function closeWindowNode(winNodeId) {
   spliceOutDoomed();
   if (keep) {
     sqlExec(`
-      UPDATE node SET is_open=0, chrome_id=NULL, updated_at=datetime('now')
+      UPDATE node SET is_open=0, chrome_id=NULL
         WHERE is_open=1 AND ${notLive}
           AND (id=${id} OR id IN (SELECT id FROM node_tree WHERE win_node_id=${id}));
       UPDATE node SET is_saved=1 WHERE id=${id};
@@ -454,15 +515,14 @@ async function onWindowCreated(win) {
     ?? (pending && Date.now() - pending.ts < 5000 ? pending.nodeId : null);
   if (existingId != null) {
     sqlRun(
-      `UPDATE node SET is_open=1, chrome_id=?, win_rect=?, relicons=?, updated_at=datetime('now') WHERE id=?`,
+      `UPDATE node SET is_open=1, chrome_id=?, win_rect=?, relicons=? WHERE id=?`,
       [win.id, rect, relicons, existingId]
     );
   } else {
-    const sid = sessionId();
     sqlInsert(
       `INSERT INTO node (node_type, is_open, is_saved, chrome_id, win_rect, relicons, parent_id, order_by)
-       VALUES ('win',1,0,?,?,?,?,(SELECT COALESCE(MAX(order_by),-1)+1 FROM node WHERE parent_id=?))`,
-      [win.id, rect, relicons, sid, sid]
+       VALUES ('win',1,0,?,?,?,NULL,${NEXT_ROOT_ORDER})`,
+      [win.id, rect, relicons]
     );
     scheduleAdoption();
   }
@@ -511,7 +571,7 @@ async function onTabCreated(tab) {
     sqlRun(
       `UPDATE node SET chrome_id=?, is_open=1, title=COALESCE(NULLIF(?,''), title), url=COALESCE(NULLIF(?,''), url),
               domain=COALESCE(?, domain), favicon_url=COALESCE(NULLIF(?,''), favicon_url),
-              position=?, updated_at=datetime('now') WHERE id=?`,
+              position=? WHERE id=?`,
       [tab.id, tab.title ?? '', url, extractDomain(url), tab.favIconUrl ?? '', tab.index ?? 0, nodeId]
     );
     await persistDb();
@@ -519,10 +579,10 @@ async function onTabCreated(tab) {
   }
 
   if (url && winNodeId) {
-    const hours = cfgNum('adopt_candidate_hours', 48);
+    const hours = cfgNum('adopt_candidate_hours', 24);
     sqlRun(
-      `UPDATE node SET chrome_id=:cid, is_open=1, position=:pos, updated_at=datetime('now')
-       WHERE id = (SELECT id FROM node_tree
+      `UPDATE node SET chrome_id=:cid, is_open=1, position=:pos
+       WHERE id =(SELECT id FROM node_tree
                    WHERE win_node_id=:win AND node_type='tab' AND is_open=0 AND is_saved=1 AND url=:url
                      AND updated_at >= datetime('now', :cut)
                    ORDER BY updated_at DESC LIMIT 1)`,
@@ -554,7 +614,7 @@ async function onTabCreated(tab) {
   let newTabId;
   if (existingId) {
     sqlRun(
-      `UPDATE node SET is_open=1, is_pinned=?, title=?, url=?, domain=?, favicon_url=?, position=?, updated_at=datetime('now') WHERE id=?`,
+      `UPDATE node SET is_open=1, is_pinned=?, title=?, url=?, domain=?, favicon_url=?, position=? WHERE id=?`,
       [tab.pinned ? 1 : 0, tab.title ?? '', url, extractDomain(url), tab.favIconUrl ?? '', tab.index ?? 0, existingId]
     );
     newTabId = existingId;
@@ -593,7 +653,7 @@ async function onTabRemoved(tabId, info) {
   if (!row) return;
 
   if (row.is_saved) {
-    sqlRun(`UPDATE node SET is_open=0, chrome_id=NULL, updated_at=datetime('now') WHERE id=?`, [row.id]);
+    sqlRun(`UPDATE node SET is_open=0, chrome_id=NULL WHERE id=?`, [row.id]);
   } else {
     sqlRun(`UPDATE node SET parent_id=? WHERE parent_id=?`, [row.parent_id, row.id]);
     sqlRun(`DELETE FROM node_tag WHERE node_id=?`, [row.id]);
@@ -604,7 +664,7 @@ async function onTabRemoved(tabId, info) {
     const winChromeId = getWinChromeId(row.parent_id);
     if (winChromeId) await syncWindowPositions(winChromeId);
   }
-  if (row.parent_id != null) renumberOrderBy([row.parent_id]);
+  renumberOrderBy([row.parent_id]);
   await persistDb();
   await updateBadge();
 }
@@ -653,12 +713,12 @@ async function onTabUpdated(tabId, changeInfo, tab) {
     await chromeReparentTab(tabId);
   }
   if (changeInfo.pinned !== undefined) {
-    sqlRun(`UPDATE node SET is_pinned=?, updated_at=datetime('now') WHERE id=?`, [changeInfo.pinned ? 1 : 0, id]);
+    sqlRun(`UPDATE node SET is_pinned=? WHERE id=?`, [changeInfo.pinned ? 1 : 0, id]);
   }
   if (changeInfo.url || changeInfo.title || changeInfo.favIconUrl) {
     const url = tab.url ?? '';
     sqlRun(
-      `UPDATE node SET title=?, url=?, domain=?, favicon_url=?, updated_at=datetime('now') WHERE id=?`,
+      `UPDATE node SET title=?, url=?, domain=?, favicon_url=? WHERE id=?`,
       [tab.title ?? '', url, extractDomain(url), tab.favIconUrl ?? '', id]
     );
     if (changeInfo.url || changeInfo.title) await applyAutoRules(id);
@@ -676,7 +736,7 @@ export async function upsertTabGroup(group) {
   const title = group.title ?? '', color = group.color ?? null, collapsed = group.collapsed ? 1 : 0;
   if (existingId) {
     sqlRun(
-      `UPDATE node SET parent_id=?, title=?, color_active=?, is_collapsed=?, is_open=1, updated_at=datetime('now') WHERE id=?`,
+      `UPDATE node SET parent_id=?, title=?, color_active=?, is_collapsed=?, is_open=1 WHERE id=?`,
       [winNodeId, title, color, collapsed, existingId]
     );
   } else {
@@ -698,7 +758,7 @@ async function onTabGroupRemoved(group) {
   if (!groupNode) return;
   sqlRun(`UPDATE node SET parent_id=? WHERE parent_id=?`, [groupNode.parent_id, groupNode.id]);
   sqlRun(`DELETE FROM node WHERE id=?`, [groupNode.id]);
-  if (groupNode.parent_id != null) renumberOrderBy([groupNode.parent_id]);
+  renumberOrderBy([groupNode.parent_id]);
   await persistDb();
 }
 

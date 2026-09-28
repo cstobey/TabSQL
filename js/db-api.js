@@ -15,5 +15,5 @@ export const db = {
   moveNode(id, parent_id, order_by) { return this.send('move_node', { id, parent_id, order_by }); },
   upsertNode(node)                  { return this.send('upsert_node', { node }); },
   preOpenTab(nodeId, url)           { return this.send('pre_open_tab', { nodeId, url }); },
-  resync()                          { return this.send('resync'); },
+  resync(dedupe = false)            { return this.send('resync', { dedupe }); },
 };

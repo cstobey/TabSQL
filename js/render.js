@@ -1,6 +1,6 @@
 import { state } from './state.js';
 import { db } from './db-api.js';
-import { escHtml, setStatus, nodeIcon, nodeLabel, highlightText, childrenOf, recomputeDupUrls } from './helpers.js';
+import { escHtml, setStatus, nodeIcon, nodeLabel, highlightText, childrenOf, fmtDate } from './helpers.js';
 import { syncFocusState, applyFocusHighlights } from './focus.js';
 
 export async function load() {
@@ -93,12 +93,14 @@ export function buildTree(parentId = null, depth = 0, searchOpts = null) {
     const pinBtn  = (n.node_type === 'tab' && n.is_open)
       ? `<button class="act act-pin" data-id="${n.id}" title="${n.is_pinned ? 'Unpin' : 'Pin'}">📌</button>`
       : '';
-    const delBtn  = n.node_type !== 'session'
-      ? `<button class="act act-del" data-id="${n.id}" title="Delete">✕</button>`
+    const newWinBtn = n.node_type !== 'win'
+      ? `<button class="act act-new-win" data-id="${n.id}" title="Move to new window">⬡</button>`
       : '';
-    const actions = `<span class="actions">${editBtn}${pinBtn}${saveBtn}${delBtn}</span>`;
+    const delBtn  = `<button class="act act-del" data-id="${n.id}" title="Delete">✕</button>`;
+    const actions = `<span class="actions">${editBtn}${pinBtn}${newWinBtn}${saveBtn}${delBtn}</span>`;
+    const upd     = fmtDate(n.updated_at);
     const noteRow = `<div class="note-row${noteText ? '' : ' empty'}" data-note-for="${n.id}"
-                         style="padding-left:${indent + 20}px">
+                         style="padding-left:calc(var(--date-w) + ${indent + 20}px)">
                       <span class="note-bar">│</span>
                       <span class="note-text">${noteHtml}</span>
                     </div>`;
@@ -108,9 +110,10 @@ export function buildTree(parentId = null, depth = 0, searchOpts = null) {
 
     const kidHtml = hasKids && !isColl ? buildTree(n.id, depth + 1, searchOpts) : '';
 
-    return `<div class="${cls}" data-id="${n.id}" data-type="${n.node_type}"
-                 draggable="${n.node_type !== 'session'}"
-                 style="padding-left:${indent + 4}px" title="${escHtml(n.url || '')}">
+    return `<div class="${cls}" data-id="${n.id}" data-type="${n.node_type}" data-depth="${depth}"
+                 draggable="true" title="${escHtml(n.url || '')}">
+              <span class="upd" title="Updated ${escHtml(upd.full)}">${escHtml(upd.short)}</span>
+              <span class="indent" style="width:${indent}px"></span>
               ${toggle}
               ${savedIndicator}
               ${dupIndicator}
@@ -138,6 +141,7 @@ export async function render(nodes, filter = '') {
     const r = await db.send('search', { q: filter });
     const matchedCount = r?.matchedCount ?? 0;
     const visibleIds = new Set(r?.visibleIds ?? []);
+    state.searchVisible = visibleIds;
 
     treeEl.innerHTML = buildTree(null, 0, { visibleIds, q: filter });
     setStatus(`${matchedCount} result${matchedCount !== 1 ? 's' : ''}`);
@@ -148,6 +152,7 @@ export async function render(nodes, filter = '') {
     applyFocusHighlights();
     return;
   }
+  state.searchVisible = null;
   searchWinBtn.style.display   = 'none';
   tagSearchBtn.style.display   = 'none';
   saveSearchBtn.style.display  = 'none';

@@ -1,10 +1,10 @@
 import {
   ensureDb, persistDb, sqlQuery, sqlRun, sqlInsert, sqlExec,
   extractDomain, buildSearchWhere, DEFAULT_QUICK_QUERIES, bgState,
-  getWinChromeId, sessionId, renumberOrderBy, rowsModified,
+  getWinChromeId, getRecursiveOpenChildren, renumberOrderBy, rowsModified, NEXT_ROOT_ORDER,
 } from './js/bg-db.js';
-import { executeActionRule } from './js/bg-rules.js';
-import { initialize, resync, cascadeChildrenToChrome } from './js/bg-sync.js';
+import { executeActionRule, chromeMoveIntoWin } from './js/bg-rules.js';
+import { initialize, resync, dedupeWindows, cascadeChildrenToChrome } from './js/bg-sync.js';
 import './js/bg-popup.js';
 
 const LEAF_TABS = `node_type='tab' AND url != '' AND id NOT IN (SELECT DISTINCT parent_id FROM node WHERE parent_id IS NOT NULL)`;
@@ -23,12 +23,11 @@ async function handleMessage(cmd, payload) {
       if ('id' in node) {
         const cols = Object.keys(node).filter(k => k !== 'id');
         sqlRun(
-          `UPDATE node SET ${cols.map(c => `${c}=?`).join(', ')}, updated_at=datetime('now') WHERE id=?`,
+          `UPDATE node SET ${cols.map(c => `${c}=?`).join(', ')} WHERE id=?`,
           [...cols.map(c => node[c] ?? null), node.id]
         );
         id = node.id;
       } else {
-        if (node.parent_id === undefined && node.node_type !== 'session') node.parent_id = sessionId();
         const cols = Object.keys(node);
         id = sqlInsert(
           `INSERT INTO node (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
@@ -58,16 +57,17 @@ async function handleMessage(cmd, payload) {
 
     // TabSQL-initiated move: the whole subtree follows in Chrome (cascade). The node
     // slots in just before the sibling holding the requested order_by; renumber packs
-    // the fractional slot back to integers on both affected parents.
+    // the fractional slot back to integers on both affected parents. updated_at is set
+    // explicitly because node_touch ignores same-parent order_by-only changes.
     case 'move_node': {
       const { id: mnId, order_by: mnOb } = payload;
-      const mnPid = payload.parent_id ?? sessionId();
+      const mnPid = payload.parent_id ?? null;
       const oldPid = sqlQuery(`SELECT parent_id FROM node WHERE id=?`, [mnId])[0]?.parent_id;
       sqlRun(
         `UPDATE node SET parent_id=?, order_by=? - 0.5, updated_at=datetime('now') WHERE id=?`,
         [mnPid, mnOb, mnId]
       );
-      renumberOrderBy([mnPid, oldPid].filter(p => p != null));
+      renumberOrderBy([mnPid, oldPid]);
       const mnRow = sqlQuery(`SELECT chrome_id, is_open FROM node WHERE id=?`, [mnId])[0];
       if (mnRow?.is_open && mnRow?.chrome_id) {
         const winChromeId = getWinChromeId(mnPid);
@@ -148,18 +148,18 @@ async function handleMessage(cmd, payload) {
           Array.from({ length: n }).flatMap((_, i) => [savedTabs[i].id, chromeTabs[i].id, i])
         );
         sqlExec(`
-          UPDATE node SET chrome_id=NULL, is_open=0, updated_at=datetime('now')
+          UPDATE node SET chrome_id=NULL, is_open=0
             WHERE node_type='tab' AND chrome_id IN (SELECT chrome_id FROM tmp_open)
               AND id NOT IN (SELECT node_id FROM tmp_open);
           UPDATE node SET
               chrome_id = (SELECT chrome_id FROM tmp_open o WHERE o.node_id = node.id),
               position  = (SELECT pos       FROM tmp_open o WHERE o.node_id = node.id),
-              is_open=1, updated_at=datetime('now')
+              is_open=1
             WHERE id IN (SELECT node_id FROM tmp_open);
           DROP TABLE tmp_open;
         `);
       }
-      sqlRun(`UPDATE node SET is_open=1, chrome_id=?, updated_at=datetime('now') WHERE id=?`, [newWin.id, wid]);
+      sqlRun(`UPDATE node SET is_open=1, chrome_id=? WHERE id=?`, [newWin.id, wid]);
       await persistDb();
       return { ok: true };
     }
@@ -167,7 +167,7 @@ async function handleMessage(cmd, payload) {
     case 'save_window': {
       const wid = Math.trunc(+payload.winNodeId);
       sqlExec(`
-        UPDATE node SET is_saved=1, updated_at=datetime('now')
+        UPDATE node SET is_saved=1
         WHERE is_saved=0
           AND (id=${wid} OR id IN (SELECT id FROM node_tree WHERE win_node_id=${wid} AND node_type='tab'));
       `);
@@ -183,7 +183,7 @@ async function handleMessage(cmd, payload) {
       if (row?.chrome_id) {
         await chrome.tabs.update(row.chrome_id, { pinned });
       }
-      sqlRun(`UPDATE node SET is_pinned=?, updated_at=datetime('now') WHERE id=?`, [pinned ? 1 : 0, nodeId]);
+      sqlRun(`UPDATE node SET is_pinned=? WHERE id=?`, [pinned ? 1 : 0, nodeId]);
       await persistDb();
       return { ok: true };
     }
@@ -380,11 +380,10 @@ async function handleMessage(cmd, payload) {
 
       let winNodeId = sqlQuery(`SELECT id FROM node WHERE chrome_id=? AND node_type='win' LIMIT 1`, [newWin.id])[0]?.id;
       if (!winNodeId) {
-        const sid = sessionId();
         winNodeId = sqlInsert(
           `INSERT INTO node (node_type, is_open, is_saved, chrome_id, win_rect, relicons, parent_id, order_by)
-           VALUES ('win',1,0,?,?,?,?,(SELECT COALESCE(MAX(order_by),-1)+1 FROM node WHERE parent_id=?))`,
-          [newWin.id, `${newWin.left}_${newWin.top}_${newWin.width}_${newWin.height}`, newWin.type ?? 'normal', sid, sid]
+           VALUES ('win',1,0,?,?,?,NULL,${NEXT_ROOT_ORDER})`,
+          [newWin.id, `${newWin.left}_${newWin.top}_${newWin.width}_${newWin.height}`, newWin.type ?? 'normal']
         );
       }
 
@@ -406,19 +405,47 @@ async function handleMessage(cmd, payload) {
         pairs.flatMap((p, i) => [p[0], p[1], i])
       );
       sqlExec(`
-        UPDATE node SET chrome_id=NULL, is_open=0, updated_at=datetime('now')
+        UPDATE node SET chrome_id=NULL, is_open=0
           WHERE node_type='tab' AND chrome_id IN (SELECT chrome_id FROM tmp_open)
             AND id NOT IN (SELECT node_id FROM tmp_open);
         UPDATE node SET
             chrome_id = (SELECT chrome_id FROM tmp_open o WHERE o.node_id = node.id),
             position  = (SELECT pos       FROM tmp_open o WHERE o.node_id = node.id),
             order_by  = (SELECT pos       FROM tmp_open o WHERE o.node_id = node.id),
-            parent_id = ${Math.trunc(+winNodeId)}, is_open=1, updated_at=datetime('now')
+            parent_id = ${Math.trunc(+winNodeId)}, is_open=1
           WHERE id IN (SELECT node_id FROM tmp_open);
         DROP TABLE tmp_open;
       `);
       await persistDb();
       return { ok: true, moved: tabs.length };
+    }
+
+    // Moves a node's subtree under a fresh root-level win node. Its open tabs (DFS
+    // order) follow in Chrome into a new window built around the first; closed ones
+    // stay closed. Live Chrome groups in the subtree drop their chrome identity first
+    // (becoming plain folders) so the emptied group's onRemoved can't delete them.
+    case 'move_to_new_window': {
+      const id = Math.trunc(+payload.id);
+      const src = sqlQuery(`SELECT parent_id, node_type, is_open, chrome_id FROM node WHERE id=?`, [id])[0];
+      if (!src || src.node_type === 'win') throw new Error('Only non-window nodes can move to a new window');
+      const tabIds = [
+        ...(src.node_type === 'tab' && src.is_open && src.chrome_id ? [src.chrome_id] : []),
+        ...getRecursiveOpenChildren(id).map(t => t.chrome_id),
+      ];
+      const winId = sqlInsert(
+        `INSERT INTO node (node_type, is_open, is_saved, parent_id, order_by) VALUES ('win',0,?,NULL,${NEXT_ROOT_ORDER})`,
+        [tabIds.length ? 0 : 1]
+      );
+      sqlRun(`UPDATE node SET parent_id=?, order_by=0 WHERE id=?`, [winId, id]);
+      sqlRun(`
+        UPDATE node SET chrome_id=NULL, is_open=0
+        WHERE node_type='group' AND chrome_id IS NOT NULL AND id IN (
+          WITH RECURSIVE d(id) AS (SELECT ? UNION ALL SELECT n.id FROM node n JOIN d ON n.parent_id = d.id)
+          SELECT id FROM d)`, [id]);
+      renumberOrderBy([src.parent_id]);
+      await chromeMoveIntoWin(winId, tabIds);
+      await persistDb();
+      return { ok: true, moved: tabIds.length };
     }
 
     case 'save_close_search': {
@@ -429,7 +456,7 @@ async function handleMessage(cmd, payload) {
       );
       if (!rows.length) return { ok: true, count: 0 };
       sqlRun(
-        `UPDATE node SET is_saved=1, is_open=0, chrome_id=NULL, updated_at=datetime('now')
+        `UPDATE node SET is_saved=1, is_open=0, chrome_id=NULL
          WHERE id IN (${rows.map(r => Math.trunc(+r.id)).join(',')})`
       );
       await persistDb();
@@ -475,9 +502,13 @@ async function handleMessage(cmd, payload) {
       return { ok: true, schema: result };
     }
 
-    case 'resync':
+    case 'resync': {
       await resync();
-      return { ok: true };
+      if (!payload?.dedupe) return { ok: true };
+      const merged = await dedupeWindows();
+      if (merged) { renumberOrderBy(); await persistDb(); }
+      return { ok: true, merged };
+    }
 
     default:
       throw new Error(`Unknown command: ${cmd}`);

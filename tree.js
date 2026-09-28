@@ -3,12 +3,12 @@
 
 import { load } from './js/render.js';
 import { loadQuickQueries, runSQL, sqlQuickEl } from './js/sql-panel.js';
-import { loadTheme, buildColorGrid } from './js/config.js';
+import { loadTheme, buildColorGrid, loadDateFormat } from './js/config.js';
 import './js/events.js';
 import './js/tags.js';
 import './js/actions-cfg.js';
 
-load();
+loadDateFormat().catch(console.error).finally(load);
 
 loadQuickQueries().then(() => {
   const first = sqlQuickEl.options[1];

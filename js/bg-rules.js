@@ -1,6 +1,6 @@
 import {
   sqlQuery, sqlRun, sqlExec, sqlInsert, persistDb, rowsModified,
-  buildSearchWhere, sessionId, renumberOrderBy, bgState,
+  buildSearchWhere, renumberOrderBy, bgState, NEXT_ROOT_ORDER,
 } from './bg-db.js';
 
 // Fills TEMP TABLE tmp_rule_match(id) with node ids matching the rule condition.
@@ -21,8 +21,8 @@ function matchRule(rule) {
 }
 
 // Finds the target window by title (config.window_name), creating it as a saved,
-// closed window under the session root when absent. Numeric target_win_id is the
-// legacy fallback for rules saved before named targets existed.
+// closed root-level window when absent. Numeric target_win_id is the legacy fallback
+// for rules saved before named targets existed.
 function resolveTargetWin(cfg) {
   if (!cfg.window_name) return cfg.target_win_id ?? null;
   const row = sqlQuery(
@@ -30,12 +30,37 @@ function resolveTargetWin(cfg) {
     [cfg.window_name]
   )[0];
   if (row) return row.id;
-  const sid = sessionId();
   return sqlInsert(
     `INSERT INTO node (node_type, title, is_open, is_saved, parent_id, order_by)
-     VALUES ('win', ?, 0, 1, ?, (SELECT COALESCE(MAX(order_by),-1)+1 FROM node WHERE parent_id=?))`,
-    [cfg.window_name, sid, sid]
+     VALUES ('win', ?, 0, 1, NULL, ${NEXT_ROOT_ORDER})`,
+    [cfg.window_name]
   );
+}
+
+// Chrome-moves open tabs (chrome ids, in order) into the win node's window. A closed
+// win node is reopened around the first tab via windows.create({tabId}) — its own
+// saved children stay closed — and pendingWinAdopt keeps onWindowCreated from
+// inserting a duplicate win row.
+export async function chromeMoveIntoWin(winId, tabChromeIds) {
+  if (!tabChromeIds.length) return;
+  let winChromeId = sqlQuery(`SELECT chrome_id FROM node WHERE id=? AND is_open=1`, [winId])[0]?.chrome_id;
+  let rest = tabChromeIds;
+  if (!winChromeId) {
+    const [first, ...others] = tabChromeIds;
+    rest = others;
+    bgState.movingTabIds.set(first, Date.now());
+    bgState.pendingWinAdopt = { nodeId: winId, ts: Date.now() };
+    const win = await chrome.windows.create({ tabId: first });
+    winChromeId = win.id;
+    sqlRun(
+      `UPDATE node SET is_open=1, chrome_id=?, relicons=?, win_rect=? WHERE id=?`,
+      [win.id, win.type ?? 'normal', `${win.left}_${win.top}_${win.width}_${win.height}`, winId]
+    );
+  }
+  for (const cid of rest) {
+    bgState.movingTabIds.set(cid, Date.now());
+    try { await chrome.tabs.move(cid, { windowId: winChromeId, index: -1 }); } catch {}
+  }
 }
 
 const ACTIONS = {
@@ -119,40 +144,19 @@ const ACTIONS = {
       CREATE TEMP TABLE tmp_rank AS
         SELECT n.id, ROW_NUMBER() OVER (ORDER BY n.order_by, n.id) - 1 rk
         FROM node n JOIN tmp_rule_match m ON m.id = n.id;
-      UPDATE node SET parent_id = ${Math.trunc(+winId)}, updated_at = datetime('now'),
+      UPDATE node SET parent_id = ${Math.trunc(+winId)},
         order_by = ${Math.trunc(+base)} + (SELECT rk FROM tmp_rank r WHERE r.id = node.id)
       WHERE id IN (SELECT id FROM tmp_rank);
       DROP TABLE tmp_rank;
     `);
-    renumberOrderBy([...new Set([winId, ...moved.map(t => t.parent_id).filter(p => p != null)])]);
-
-    const open = moved.filter(t => t.is_open && t.chrome_id);
-    if (open.length) {
-      let winChromeId = sqlQuery(`SELECT chrome_id FROM node WHERE id=? AND is_open=1`, [winId])[0]?.chrome_id;
-      let rest = open;
-      if (!winChromeId) {
-        const first = open[0];
-        rest = open.slice(1);
-        bgState.movingTabIds.set(first.chrome_id, Date.now());
-        bgState.pendingWinAdopt = { nodeId: winId, ts: Date.now() };
-        const win = await chrome.windows.create({ tabId: first.chrome_id });
-        winChromeId = win.id;
-        sqlRun(
-          `UPDATE node SET is_open=1, chrome_id=?, relicons=?, win_rect=?, updated_at=datetime('now') WHERE id=?`,
-          [win.id, win.type ?? 'normal', `${win.left}_${win.top}_${win.width}_${win.height}`, winId]
-        );
-      }
-      for (const t of rest) {
-        bgState.movingTabIds.set(t.chrome_id, Date.now());
-        try { await chrome.tabs.move(t.chrome_id, { windowId: winChromeId, index: -1 }); } catch {}
-      }
-    }
+    renumberOrderBy([...new Set([winId, ...moved.map(t => t.parent_id)])]);
+    await chromeMoveIntoWin(winId, moved.filter(t => t.is_open && t.chrome_id).map(t => t.chrome_id));
     return moved.length;
   },
 
   save_on_close() {
     sqlRun(`
-      UPDATE node SET is_saved=1, updated_at=datetime('now')
+      UPDATE node SET is_saved=1
       WHERE id IN (SELECT id FROM tmp_rule_match) AND node_type='tab' AND is_saved=0`);
     return rowsModified();
   },

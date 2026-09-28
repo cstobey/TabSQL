@@ -127,6 +127,16 @@ document.getElementById('sql-run').addEventListener('click', () => {
   if (sql) runSQL(sql);
 });
 
+// Feeds the last result's node ids (id, else node_id column) to the tree search as an
+// id: term; clearing the search box restores the full tree.
+document.getElementById('sql-filter-tree').addEventListener('click', () => {
+  const ids = [...new Set(sqlLastRows.map(r => r.id ?? r.node_id).filter(Number.isInteger))];
+  if (!ids.length) { document.getElementById('sql-status').textContent = 'No id column in results'; return; }
+  const search = document.getElementById('search');
+  search.value = `id:${ids.join(',')}`;
+  search.dispatchEvent(new Event('input'));
+});
+
 document.getElementById('sql-export-csv').addEventListener('click', () => {
   if (!sqlLastRows.length) return;
   const cols = Object.keys(sqlLastRows[0]);

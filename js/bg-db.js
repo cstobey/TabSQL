@@ -94,6 +94,11 @@ export function buildSearchWhere(q) {
       case 'tag':
         clauses.push('id IN (SELECT nt.node_id FROM node_tag nt JOIN tag t2 ON t2.id=nt.tag_id WHERE t2.name LIKE ?)');
         params.push(like); break;
+      case 'id': {
+        const ids = t.value.split(',').map(Number).filter(Number.isInteger);
+        clauses.push(ids.length ? `id IN (${ids.map(() => '?').join(',')})` : '0');
+        params.push(...ids); break;
+      }
       default:
         clauses.push('(title LIKE ? OR url LIKE ? OR note_text LIKE ?)');
         params.push(like, like, like);
@@ -210,21 +215,35 @@ function applySchema() {
     db.exec(`UPDATE node SET order_by = position`);
   } catch {}
 
-  // Single session root; every other root-level node hangs under it
+  // Migration: the former single 'session' root is gone; its children become roots
   db.exec(`
-    INSERT INTO node (node_type, title, order_by)
-    SELECT 'session', 'Session', 0 WHERE NOT EXISTS (SELECT 1 FROM node WHERE node_type='session');
-    UPDATE node SET parent_id=(SELECT id FROM node WHERE node_type='session')
-    WHERE parent_id IS NULL AND node_type!='session';
+    UPDATE node SET parent_id=NULL WHERE parent_id IN (SELECT id FROM node WHERE node_type='session');
+    DELETE FROM node_tag WHERE node_id IN (SELECT id FROM node WHERE node_type='session');
+    DELETE FROM node WHERE node_type='session';
+  `);
+
+  // updated_at tracks meaningful change only. Chrome-mirror churn (position, chrome_id,
+  // favicon, win_rect, collapse) and renumbering (order_by) don't count; user moves
+  // that only touch order_by set updated_at explicitly, which this trigger respects.
+  db.exec(`
+    DROP TRIGGER IF EXISTS node_touch;
+    CREATE TRIGGER node_touch AFTER UPDATE ON node
+    WHEN NEW.updated_at IS OLD.updated_at AND (
+         NEW.parent_id    IS NOT OLD.parent_id    OR NEW.node_type   IS NOT OLD.node_type
+      OR NEW.is_open      IS NOT OLD.is_open      OR NEW.is_saved    IS NOT OLD.is_saved
+      OR NEW.is_pinned    IS NOT OLD.is_pinned    OR NEW.title       IS NOT OLD.title
+      OR NEW.url          IS NOT OLD.url          OR NEW.note_text   IS NOT OLD.note_text
+      OR NEW.color_active IS NOT OLD.color_active OR NEW.color_saved IS NOT OLD.color_saved)
+    BEGIN
+      UPDATE node SET updated_at = datetime('now') WHERE id = NEW.id;
+    END;
   `);
 
   const count = sqlQuery('SELECT COUNT(*) c FROM quick_query')[0]?.c ?? 0;
   if (+count === 0) seedDefaultQueries();
 }
 
-export function sessionId() {
-  return sqlQuery(`SELECT id FROM node WHERE node_type='session' LIMIT 1`)[0]?.id ?? null;
-}
+export const NEXT_ROOT_ORDER = `(SELECT COALESCE(MAX(order_by),-1)+1 FROM node WHERE parent_id IS NULL)`;
 
 export function rowsModified() {
   return db.getRowsModified();
@@ -236,11 +255,18 @@ export function cfgNum(key, def) {
 }
 
 // Re-pack order_by to 0..n-1 per parent (ties broken by id); pass parent ids to limit
-// scope. Ranks are materialized first because an UPDATE's correlated subqueries see
-// rows the same statement already modified.
+// scope (null = the root level). Ranks are materialized first because an UPDATE's
+// correlated subqueries see rows the same statement already modified.
 export function renumberOrderBy(parentIds = null) {
-  const ids = parentIds?.map(Number).filter(Number.isFinite);
-  const filter = ids?.length ? `WHERE parent_id IN (${ids.join(',')})` : '';
+  let filter = '';
+  if (parentIds) {
+    const ids = parentIds.filter(p => p != null).map(p => Math.trunc(+p)).filter(Number.isFinite);
+    const conds = [
+      ...(ids.length ? [`parent_id IN (${ids.join(',')})`] : []),
+      ...(parentIds.some(p => p == null) ? ['parent_id IS NULL'] : []),
+    ];
+    filter = `WHERE ${conds.join(' OR ') || '0'}`;
+  }
   sqlExec(`
     DROP TABLE IF EXISTS tmp_ord;
     CREATE TEMP TABLE tmp_ord AS

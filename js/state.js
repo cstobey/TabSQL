@@ -9,5 +9,7 @@ export const state = {
   nodeTagsMap:    {},
   dupUrls:        new Set(),
   tagPickerNodeId: null,
+  searchVisible:  null,          // Set of visible node ids while a search filter is active
+  dateFormat:     'MM-DD h:mm A',
   focusState:     { activeTabChromeIds: new Set(), focusedWinChromeId: null },
 };

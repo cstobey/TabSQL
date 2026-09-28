@@ -1,6 +1,6 @@
 import { state } from './state.js';
 import { db } from './db-api.js';
-import { escHtml, setStatus, nodeLabel, childrenOf, allDescendantIds, recomputeDupUrls } from './helpers.js';
+import { escHtml, setStatus, nodeLabel, childrenOf, allDescendantIds, recomputeDupUrls, subtreeMarkdown } from './helpers.js';
 import { syncFocusState, applyFocusHighlights } from './focus.js';
 import { load, render } from './render.js';
 import { openTagPicker } from './tags.js';
@@ -120,6 +120,13 @@ treeEl.addEventListener('click', async e => {
     return;
   }
 
+  if (btn.classList.contains('act-new-win')) {
+    const r = await db.send('move_to_new_window', { id });
+    setStatus(`Moved to new window (${r?.moved ?? 0} open tab${r?.moved === 1 ? '' : 's'})`);
+    scheduleRefresh();
+    return;
+  }
+
   if (btn.classList.contains('act-pin')) {
     await db.send('set_tab_pinned', { nodeId: id, pinned: !n.is_pinned });
     scheduleRefresh();
@@ -135,7 +142,6 @@ treeEl.addEventListener('click', async e => {
 // so the resulting Chrome events find nothing; tabs close before the window so an
 // emptied window closes itself and the windows.remove is just a fallback.
 async function deleteSubtree(n) {
-  if (n.node_type === 'session') { setStatus('Cannot delete the session root'); return; }
   const descIds = allDescendantIds(n.id);
   const closeTabs = [...descIds].map(d => state.nodeMap[d])
     .filter(x => x?.node_type === 'tab' && x.is_open && x.chrome_id)
@@ -208,8 +214,9 @@ treeEl.addEventListener('dragstart', e => {
   const node = e.target.closest('.node');
   if (!node) return;
   state.dragSrcId = +node.dataset.id;
-  e.dataTransfer.effectAllowed = 'move';
-  e.dataTransfer.setData('text/plain', String(state.dragSrcId));
+  // In-tree drops read state.dragSrcId; text/plain is for drops into external editors
+  e.dataTransfer.effectAllowed = 'copyMove';
+  e.dataTransfer.setData('text/plain', subtreeMarkdown(state.dragSrcId));
   setTimeout(() => node.classList.add('dragging'), 0);
 });
 
@@ -228,11 +235,9 @@ treeEl.addEventListener('dragover', e => {
   const targetId = +node.dataset.id;
   if (targetId === state.dragSrcId) return;
 
-  const treeRect  = treeEl.getBoundingClientRect();
-  const mouseX    = e.clientX - treeRect.left;
-  const indentPx  = parseInt(node.style.paddingLeft) || 4;
-  const nodeLevel = Math.round((indentPx - 4) / 16);
-  const hoverLevel = Math.max(0, Math.floor((mouseX - 4) / 16));
+  const nodeLevel  = +node.dataset.depth || 0;
+  const indentLeft = node.querySelector('.indent').getBoundingClientRect().left;
+  const hoverLevel = Math.max(0, Math.floor((e.clientX - indentLeft) / 16));
 
   let parentId;
   if (hoverLevel >= nodeLevel) {
@@ -289,9 +294,10 @@ document.getElementById('search').addEventListener('input', e => {
 // ── Toolbar buttons ───────────────────────────────────────────────────────────
 
 document.getElementById('btn-refresh').addEventListener('click', async () => {
-  await db.resync();
+  const r = await db.resync(true);
   await syncFocusState();
   await load();
+  if (r?.merged) setStatus(`Merged ${r.merged} duplicate window${r.merged !== 1 ? 's' : ''} · ${document.getElementById('status').textContent}`);
 });
 
 // ── Live updates ──────────────────────────────────────────────────────────────

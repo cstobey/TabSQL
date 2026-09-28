@@ -1,6 +1,7 @@
+import { state } from './state.js';
 import { db } from './db-api.js';
-import { escHtml } from './helpers.js';
-import { load } from './render.js';
+import { escHtml, formatDate } from './helpers.js';
+import { load, render } from './render.js';
 
 export const COLOR_VARS = [
   { prop: '--bg',        label: 'Background',       def: '#1e1e2e' },
@@ -60,6 +61,36 @@ export function buildColorGrid(theme) {
     });
   });
 }
+
+// ── Date format (config key date_format; '' hides the column) ────────────────
+
+const dateFmtEl = document.getElementById('cfg-date-format');
+
+// Sizes the .upd column to the widest rendering of the format (two-digit month, day
+// and hour) at ~6px per char of its 10px monospace font.
+function applyDateFormat(fmt) {
+  state.dateFormat = fmt;
+  const len = formatDate(new Date(2000, 11, 28, 22, 59, 59), fmt).length;
+  document.documentElement.style.setProperty('--date-w', len ? `${len * 6 + 8}px` : '0px');
+  document.getElementById('cfg-date-preview').textContent = formatDate(new Date(), fmt);
+}
+
+export async function loadDateFormat() {
+  const r = await db.send('get_config', { key: 'date_format' });
+  const fmt = r?.value ?? state.dateFormat;
+  dateFmtEl.value = fmt;
+  applyDateFormat(fmt);
+}
+
+let dateFmtTimer = null;
+dateFmtEl.addEventListener('input', () => {
+  clearTimeout(dateFmtTimer);
+  dateFmtTimer = setTimeout(async () => {
+    applyDateFormat(dateFmtEl.value);
+    await render(state.allNodes, document.getElementById('search').value.trim());
+    await db.send('set_config', { key: 'date_format', value: dateFmtEl.value });
+  }, 300);
+});
 
 document.getElementById('btn-config').addEventListener('click', () => {
   document.getElementById('config-panel').classList.toggle('hidden');
@@ -169,6 +200,8 @@ async function importTabOutliner(text) {
     if (!Array.isArray(item)) continue;
     if (item[0] !== TO_NODE_INSERT) continue;
     if (item.length < 3) continue;
+    // TabOutliner's session root has no TabSQL equivalent; its children become roots
+    if (item[1]?.type === 'session') continue;
 
     const path      = item[2];
     const pathKey   = path.join(',');
@@ -223,8 +256,7 @@ async function exportTabOutliner() {
          });
   }
 
-  const session = nodes.find(n => n.node_type === 'session');
-  traverse(session ? session.id : null, []);
+  traverse(null, []);
   result.push([TO_EOF_OP]);
 
   downloadFile('tabsql-export.tree', JSON.stringify(result, null, 2), 'application/json');

@@ -27,6 +27,7 @@
     --focus-bg: #003d4f;
     --indent:   16px;
     --row-h:    28px;
+    --date-w:   66px;
   }
 
   body { background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, sans-serif;
@@ -76,6 +77,10 @@
   .node:hover { background: var(--hover); }
   .node.selected { background: #0f4055; }
 
+  .upd     { width: var(--date-w); flex-shrink: 0; color: var(--muted); font: 10px 'JetBrains Mono','Consolas',monospace;
+             white-space: nowrap; overflow: hidden; }
+  .indent  { flex-shrink: 0; }
+  .node[data-type="split"] .upd { visibility: hidden; }
   .toggle  { width: 14px; flex-shrink: 0; color: var(--muted); font-size: 10px; text-align: center; }
   .icon    { width: 16px; flex-shrink: 0; font-size: 12px; margin: 0 3px; }
   .dup-dot   { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--dup-url); margin: 0 3px 0 0; flex-shrink: 0; }
@@ -177,6 +182,9 @@
   .cfg-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .cfg-lbl { font-size: 11px; color: var(--muted); }
   #cfg-io-status { font-size: 11px; color: var(--muted); }
+  .cfg-input { background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 3px;
+               padding: 2px 6px; font: 11px 'JetBrains Mono','Consolas',monospace; outline: none; width: 150px; }
+  .cfg-input:focus { border-color: var(--accent); }
   .cfg-colors-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
   .cfg-color-row { display: flex; align-items: center; gap: 6px; }
   .cfg-color-row label { font-size: 11px; color: var(--text); flex: 1; min-width: 0; }
@@ -279,6 +287,17 @@
     </div>
   </div>
   <div class="cfg-section">
+    <div class="cfg-hdr" data-target="cfg-display-body">Display</div>
+    <div id="cfg-display-body" class="cfg-body">
+      <div class="cfg-row">
+        <label class="cfg-lbl" for="cfg-date-format">Updated date format</label>
+        <input type="text" id="cfg-date-format" class="cfg-input" placeholder="empty hides the column" spellcheck="false">
+        <span id="cfg-date-preview" class="cfg-lbl"></span>
+      </div>
+      <div class="cfg-lbl">Tokens: YYYY YY MM DD HH H (24h) hh h (12h) mm ss A a — other text is literal</div>
+    </div>
+  </div>
+  <div class="cfg-section">
     <div class="cfg-hdr" data-target="cfg-colors-body">Colors</div>
     <div id="cfg-colors-body" class="cfg-body">
       <div id="cfg-colors-grid" class="cfg-colors-grid"></div>
@@ -334,6 +353,7 @@
       <button class="btn" id="sql-schema" title="Show schema">📋</button>
       <div style="margin-left:auto;display:flex;align-items:center;gap:6px">
         <button class="btn" id="sql-run">▶ Run</button>
+        <button class="btn" id="sql-filter-tree" title="Filter tree to result node ids (id column)">⧩ Filter</button>
         <button class="btn" id="sql-export-csv" title="Export results to CSV">⬇ CSV</button>
         <span id="sql-status"></span>
       </div>
